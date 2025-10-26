@@ -3,34 +3,6 @@ import io, datetime as dt
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine
-def parse_price_csv(txt: str) -> pd.DataFrame:
-    """Harem/Özbağ CSV metnini robust okur.
-    - Ad/Alış/Satış veya name/buy/sell başlıklarını destekler
-    - Başlıksız listeleri (sadece satırlar) destekler
-    """
-    # 1) Başlık var diye dene
-    df = pd.read_csv(io.StringIO(txt), header=0)
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.rename(columns={
-        "Ad": "name", "ad": "name", "AD": "name",
-        "Alış": "buy", "Alis": "buy",
-        "Satış": "sell", "Satis": "sell"
-    })
-    if {"name", "buy", "sell"}.issubset(set(df.columns)):
-        pass
-    else:
-        # 2) Başlıksız gibi tekrar oku
-        df = pd.read_csv(io.StringIO(txt), header=None)
-        if df.shape[1] < 3:
-            raise ValueError("CSV en az 3 sütun olmalı (Ad/Alış/Satış).")
-        df = df.iloc[:, :3]
-        df.columns = ["name", "buy", "sell"]
-
-    # Temizlik
-    df["name"] = df["name"].astype(str).str.strip()
-    df["buy"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0)
-    df["sell"] = pd.to_numeric(df["sell"], errors="coerce").fillna(0)
-    return df[["name", "buy", "sell"]]
 
 # ---------------------------------
 # VERİTABANI
@@ -112,25 +84,7 @@ if page == "Fiyatlar (Özbağ & Harem)":
     h_txt = st.text_area("CSV'yi buraya yapıştır", height=120, key="harem_csv")
     if st.button("Harem İçeri Al"):
         try:
-            if st.button("Harem İçeri Al"):
-    try:
-        df = parse_price_csv(h_txt)
-        df["source"] = "HAREM"
-        df["ts"] = dt.datetime.utcnow()
-        write_df("prices", df[["source", "name", "buy", "sell", "ts"]], if_exists="append")
-        st.success("Harem fiyatları kaydedildi.")
-    except Exception as e:
-        st.error(f"Hata: {e}")
-            # Türkçe başlık uyumluluğu
-df.columns = [c.strip() for c in df.columns]
-df = df.rename(columns={
-    "Ad": "name", "ad": "name",
-    "Alış": "buy", "Alis": "buy",
-    "Satış": "sell", "Satis": "sell"
-})
-# Başlıksız yapıştırıldıysa ve 3 sütun varsa otomatik isim ver
-if list(df.columns) == [0, 1, 2]:
-    df.columns = ["name", "buy", "sell"]
+            df = pd.read_csv(io.StringIO(h_txt))
             df["source"] = "HAREM"
             df["ts"] = dt.datetime.utcnow()
             write_df("prices", df[["source","name","buy","sell","ts"]], if_exists="append")
@@ -143,25 +97,7 @@ if list(df.columns) == [0, 1, 2]:
     o_txt = st.text_area("CSV'yi buraya yapıştır", height=120, key="ozbag_csv")
     if st.button("Özbağ İçeri Al"):
         try:
-            if st.button("Özbağ İçeri Al"):
-    try:
-        df = parse_price_csv(o_txt)
-        df["source"] = "OZBAG"
-        df["ts"] = dt.datetime.utcnow()
-        write_df("prices", df[["source", "name", "buy", "sell", "ts"]], if_exists="append")
-        st.success("Özbağ fiyatları kaydedildi.")
-    except Exception as e:
-        st.error(f"Hata: {e}")
-            # Türkçe başlık uyumluluğu
-df.columns = [c.strip() for c in df.columns]
-df = df.rename(columns={
-    "Ad": "name", "ad": "name",
-    "Alış": "buy", "Alis": "buy",
-    "Satış": "sell", "Satis": "sell"
-})
-# Başlıksız yapıştırıldıysa ve 3 sütun varsa otomatik isim ver
-if list(df.columns) == [0, 1, 2]:
-    df.columns = ["name", "buy", "sell"]
+            df = pd.read_csv(io.StringIO(o_txt))
             df["source"] = "OZBAG"
             df["ts"] = dt.datetime.utcnow()
             write_df("prices", df[["source","name","buy","sell","ts"]], if_exists="append")

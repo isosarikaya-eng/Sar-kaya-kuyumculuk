@@ -29,6 +29,25 @@ PRODUCTS = {
     "Ata Lira":       {"unit": "adet", "std_weight": 7.216, "purity": 0.916, "sell_add": 200, "buy_sub": 200, "harem_key": "Ata",    "ozbag_key": "Ata"},
     "24 Ayar Gram":   {"unit": "gram", "std_weight": 1.00,  "purity": 0.995, "sell_add":  10, "buy_sub":  20, "harem_key": "Gram 24 Ayar", "ozbag_key": "Gram 24 Ayar"},
 }
+# Harem tarafındaki isimler için esnek eş-adlar
+HAREM_NAME_ALIASES = {
+    "Çeyrek Altın": ["Eski Çeyrek", "Çeyrek"],
+    "Yarım Altın":  ["Eski Yarım", "Yarım"],
+    "Tam Altın":    ["Eski Tam", "Tam"],
+    "Ata Lira":     ["Eski Ata", "Ata", "Ata Lira"],
+    "24 Ayar Gram": ["Gram 24 Ayar", "24 Ayar Gram"],
+}
+
+def get_price_by_any(source: str, names: list[str], field: str = "sell") -> float | None:
+    """Verilen isim adaylarından ilk bulunanın fiyatını getirir."""
+    df = latest_prices(source)
+    if df.empty:
+        return None
+    for nm in names:
+        row = df[df["name"] == nm]
+        if not row.empty:
+            return float(row.iloc[0][field])
+    return None
 
 # ---------------------------------
 # YARDIMCI FONKSİYONLAR
@@ -52,14 +71,15 @@ def get_price(source: str, name: str, field: str = "sell") -> float | None:
     return float(m.iloc[0][field])
 
 def suggested_price(product_name: str, ttype: str) -> float | None:
-    p = PRODUCTS[product_name]
-    base = get_price("HAREM", p["harem_key"], "sell")
+    # Harem'de "Eski ..." isimlerini öncelikli baz al
+    aliases = HAREM_NAME_ALIASES.get(product_name, [product_name])
+    base = get_price_by_any("HAREM", aliases, "sell")
     if base is None:
         return None
     if ttype == "Satış":
-        return base + p["sell_add"]
-    else:  # Alış
-        return max(0.0, base - p["buy_sub"])
+        return base + PRODUCTS[product_name]["sell_add"]
+    else:
+        return max(0.0, base - PRODUCTS[product_name]["buy_sub"])
 
 def compute_has(product_name: str, qty_or_gram: float) -> float:
     p = PRODUCTS[product_name]

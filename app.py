@@ -39,7 +39,6 @@ HAREM_NAME_ALIASES = {
 }
 
 def get_price_by_any(source: str, names: list[str], field: str = "sell") -> float | None:
-    """Verilen isim adaylarından ilk bulunanın fiyatını getirir."""
     df = latest_prices(source)
     if df.empty:
         return None
@@ -48,6 +47,18 @@ def get_price_by_any(source: str, names: list[str], field: str = "sell") -> floa
         if not row.empty:
             return float(row.iloc[0][field])
     return None
+
+
+def suggested_price(product_name: str, ttype: str) -> float | None:
+    # Harem'de "Eski ..." isimlerini öncelikli baz al
+    aliases = HAREM_NAME_ALIASES.get(product_name, [product_name])
+    base = get_price_by_any("HAREM", aliases, "sell")
+    if base is None:
+        return None
+    if ttype == "Satış":
+        return base + PRODUCTS[product_name]["sell_add"]
+    else:
+        return max(0.0, base - PRODUCTS[product_name]["buy_sub"])
 
 # ---------------------------------
 # YARDIMCI FONKSİYONLAR

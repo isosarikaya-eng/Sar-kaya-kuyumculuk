@@ -85,6 +85,16 @@ if page == "Fiyatlar (Özbağ & Harem)":
     if st.button("Harem İçeri Al"):
         try:
             df = pd.read_csv(io.StringIO(h_txt))
+            # Türkçe başlık uyumluluğu
+df.columns = [c.strip() for c in df.columns]
+df = df.rename(columns={
+    "Ad": "name", "ad": "name",
+    "Alış": "buy", "Alis": "buy",
+    "Satış": "sell", "Satis": "sell"
+})
+# Başlıksız yapıştırıldıysa ve 3 sütun varsa otomatik isim ver
+if list(df.columns) == [0, 1, 2]:
+    df.columns = ["name", "buy", "sell"]
             df["source"] = "HAREM"
             df["ts"] = dt.datetime.utcnow()
             write_df("prices", df[["source","name","buy","sell","ts"]], if_exists="append")
@@ -98,6 +108,16 @@ if page == "Fiyatlar (Özbağ & Harem)":
     if st.button("Özbağ İçeri Al"):
         try:
             df = pd.read_csv(io.StringIO(o_txt))
+            # Türkçe başlık uyumluluğu
+df.columns = [c.strip() for c in df.columns]
+df = df.rename(columns={
+    "Ad": "name", "ad": "name",
+    "Alış": "buy", "Alis": "buy",
+    "Satış": "sell", "Satis": "sell"
+})
+# Başlıksız yapıştırıldıysa ve 3 sütun varsa otomatik isim ver
+if list(df.columns) == [0, 1, 2]:
+    df.columns = ["name", "buy", "sell"]
             df["source"] = "OZBAG"
             df["ts"] = dt.datetime.utcnow()
             write_df("prices", df[["source","name","buy","sell","ts"]], if_exists="append")

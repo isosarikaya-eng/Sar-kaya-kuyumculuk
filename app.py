@@ -112,6 +112,39 @@ if page == "Fiyatlar (Özbağ & Harem)":
     with col2:
         st.markdown("#### Son Özbağ Fiyatları")
         st.dataframe(latest_prices("OZBAG"))
+        elif page == "İşlem (Alış/Satış)":
+    st.subheader("📦 Yeni İşlem")
+    product_name = st.selectbox("Ürün", list(PRODUCTS.keys()))
+    ttype = st.radio("Tür", ["Satış","Alış"], horizontal=True)
+
+    unit = PRODUCTS[product_name]["unit"]
+    if unit == "adet":
+        qty_or_gram = st.number_input("Adet", min_value=1.0, value=1.0, step=1.0)
+        unit_label = "Adet"
+    else:
+        qty_or_gram = st.number_input("Gram", min_value=0.01, value=1.00, step=0.01, format="%.2f")
+        unit_label = "Gram"
+
+    sug = suggested_price(product_name, ttype)
+    price = st.number_input("Birim Fiyat (TL)", value=float(sug or 0.0), min_value=0.0, step=1.0)
+
+    note = st.text_input("Not (opsiyonel)")
+    if st.button("Kaydet"):
+        has_grams = compute_has(product_name, qty_or_gram)
+        total = price * qty_or_gram
+        df = pd.DataFrame([{
+            "date": dt.date.today().isoformat(),
+            "product": product_name,
+            "ttype": ttype,
+            "unit": unit,
+            "qty_or_gram": qty_or_gram,
+            "unit_price": price,
+            "total": total,
+            "has_grams": has_grams if ttype=="Alış" else -has_grams,
+            "note": note
+        }])
+        write_df("transactions", df)
+        st.success(f"{product_name} için {ttype} kaydedildi. ({unit_label}: {qty_or_gram}, Fiyat: {price:.0f}₺)")
 
 # ---------------- İŞLEM ----------------
 elif page == "İşlem (Alış/Satış)":
@@ -151,6 +184,24 @@ elif page == "İşlem (Alış/Satış)":
         st.success(f"{product_name} için {ttype} kaydedildi. ({unit_label}: {qty_or_gram}, Fiyat: {price:.0f}₺)")
 
     st.caption("Önerilen fiyatlar Harem satış fiyatına göre marj uygulanarak hesaplanır; envanter has maliyet referansı Özbağ’dır.")
+    elif page == "Envanter Raporu":
+    st.subheader("📊 Envanter (Has Bazlı Özet)")
+
+    tx = read_sql("transactions")
+    if tx.empty:
+        st.info("Henüz işlem yok. 'İşlem (Alış/Satış)' sekmesinden kayıt ekleyin.")
+    else:
+        # Net has (alış +, satış -)
+        total_has = tx["has_grams"].sum()
+        st.metric("Toplam Has (gr)", f"{total_has:,.2f}")
+
+        # Referans değerleme: Özbağ 24 Ayar satış
+        oz_24 = get_price("OZBAG", "Gram 24 Ayar", "sell")
+        if oz_24:
+            st.metric("Has Karşılığı (TL) – Özbağ 24k", f"{(total_has * oz_24):,.0f} ₺")
+
+        st.markdown("### İşlem Listesi")
+        st.dataframe(tx.sort_values(["date"], ascending=False).reset_index(drop=True))
 
 # ---------------- ENVANTER ----------------
 else:

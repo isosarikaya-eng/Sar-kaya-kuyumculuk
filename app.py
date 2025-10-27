@@ -514,4 +514,41 @@ def tab_cash_and_liabilities():
             st.dataframe(show, use_container_width=True, height=220)
             rid2 = st.number_input("Silinecek borç/alacak id", min_value=0, step=1, value=0, format="%d")
             if st.button("Borç/Alacak Kaydı Sil"):
-                if rid2>0: delete_liability(int(rid2)); st.success("Silindi. Yen
+                if rid2>0: delete_liability(int(rid2)); st.success("Silindi. Yenileyin.")
+                else: st.warning("Geçerli ID girin.")
+
+    # ---- Kişi kartı (hızlı kontrol) ----
+    st.markdown("### 👤 Kişi Özeti")
+    who = st.text_input("Kişi adı (tam yaz):", key="person_lookup")
+    if who.strip():
+        li, cm = person_card(who.strip())
+        colx, coly = st.columns(2)
+        with colx:
+            st.markdown("**Gram Hareketleri (Borç/Alacak)**")
+            if li.empty: st.info("Kayıt yok.")
+            else: st.dataframe(li[["tdate","side","Ürün","grams","Gram (±)","note"]].rename(
+                columns={"tdate":"tarih","side":"taraf","grams":"gram","note":"not"}), use_container_width=True, height=220)
+        with coly:
+            st.markdown("**TL Hareketleri (Tahsilat/Ödeme)**")
+            if cm.empty: st.info("Kayıt yok.")
+            else: st.dataframe(cm.rename(columns={"tdate":"tarih","mtype":"tür","amount":"tutar","note":"not"}), use_container_width=True, height=220)
+
+# =============== ANA ===============
+def main():
+    ensure_db()
+    header()
+    t1, t2, t3, t4, t5 = st.tabs([
+        "🧾 Alış / Satış",
+        "📦 Envanter & Kasa",
+        "📈 Kâr/Zarar",
+        "🧰 Açılış Stokları",
+        "🤝 Tahsilat/Ödeme & Borç/Alacak"
+    ])
+    with t1: tab_txn()
+    with t2: tab_envanter()
+    with t3: tab_pnl()
+    with t4: tab_opening()
+    with t5: tab_cash_and_liabilities()
+
+if __name__ == "__main__":
+    main()

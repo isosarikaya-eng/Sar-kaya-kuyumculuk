@@ -1,356 +1,352 @@
-# app.py — Sarıkaya Kuyumculuk • Harem Otomatik Entegrasyon (tam otomatik, marjlı)
-import re, io, time
+import sqlite3
+from contextlib import closing
+from datetime import datetime, date
+from typing import List, Dict, Tuple
+
 import pandas as pd
-import datetime as dt
 import streamlit as st
-from sqlalchemy import create_engine, text
 
-# ============== GENEL AYARLAR ==============
-st.set_page_config(page_title="Sarıkaya Kuyumculuk – Harem Otomatik", layout="wide")
+# ============ GENEL AYAR ============
+st.set_page_config(page_title="Sarıkaya Kuyumculuk — Kâr/Zarar & Envanter", layout="wide")
 
-DB_URL = "sqlite:///sarikkaya.db"
-HAREM_URL = "https://www.haremaltin.com/"
-AUTO_REFRESH_MS = 30_000  # 30 sn'de bir otomatik yenile
+DB_PATH = "data.db"
 
-# Ürün tanımları (has hesabı için gerekirse)
-PRODUCTS = {
-    "Çeyrek Altın": {"unit": "adet", "std_weight": 1.75,  "purity": 0.916,
-                     "harem_alias": ["ESKİ ÇEYREK", "ESKI CEYREK", "ÇEYREK"]},
-    "Yarım Altın" : {"unit": "adet", "std_weight": 3.50,  "purity": 0.916,
-                     "harem_alias": ["ESKİ YARIM", "ESKI YARIM", "YARIM"]},
-    "Tam Altın"   : {"unit": "adet", "std_weight": 7.00,  "purity": 0.916,
-                     "harem_alias": ["ESKİ TAM", "ESKI TAM", "TAM"]},
-    "Ata Lira"    : {"unit": "adet", "std_weight": 7.216, "purity": 0.916,
-                     "harem_alias": ["ESKİ ATA", "ESKI ATA", "ATA"]},
-    "24 Ayar Gram": {"unit": "gram", "std_weight": 1.00,  "purity": 0.995,
-                     "harem_alias": ["GRAM ALTIN", "HAS ALTIN", "24 AYAR"]},
-}
+PRODUCTS = [
+    ("CEYREK", "Çeyrek Altın", "adet"),
+    ("YARIM", "Yarım Altın", "adet"),
+    ("TAM", "Tam Altın", "adet"),
+    ("ATA", "Ata Lira", "adet"),
+    ("G24", "24 Ayar Gram", "gr"),
+    ("G22", "22 Ayar Gram", "gr"),
+    ("G22_05", "22 Ayar 0,5 gr", "gr"),
+    ("G22_025", "22 Ayar 0,25 gr", "gr"),
+]
 
-# Marj kuralları
-MARGINS = {
-    # Gram (Harem SATIŞ baz)
-    "24 Ayar Gram": {"buy_from": "sell", "buy_delta": -20.0, "sell_from": "sell", "sell_delta": +10.0},
-    # Eski sikkeler (Harem ALIŞ/ SATIŞ baz)
-    "Çeyrek Altın": {"buy_from": "buy",  "buy_delta": -50.0,  "sell_from": "sell", "sell_delta": +50.0},
-    "Yarım Altın" : {"buy_from": "buy",  "buy_delta": -100.0, "sell_from": "sell", "sell_delta": +100.0},
-    "Tam Altın"   : {"buy_from": "buy",  "buy_delta": -200.0, "sell_from": "sell", "sell_delta": +200.0},
-    "Ata Lira"    : {"buy_from": "buy",  "buy_delta": -200.0, "sell_from": "sell", "sell_delta": +200.0},
-}
+# ============ DB KATMANI ============
+def conn():
+    return sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
 
-# ============== DB ==============
-@st.cache_resource(show_spinner=False)
-def get_engine():
-    eng = create_engine(DB_URL, future=True)
-    with eng.begin() as c:
-        c.execute(text("""
-            CREATE TABLE IF NOT EXISTS prices(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT,      -- 'HAREM'
-                name   TEXT,      -- Harem kart başlığı (Eski Çeyrek, Gram Altın...)
-                buy    REAL,
-                sell   REAL,
-                ts     TEXT
+def ensure_db():
+    with closing(conn()) as c, c, closing(c.cursor()) as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS products(
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            unit TEXT NOT NULL
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS opening(
+            product_code TEXT PRIMARY KEY,
+            qty REAL NOT NULL DEFAULT 0,
+            unit_cost REAL NOT NULL DEFAULT 0,
+            FOREIGN KEY(product_code) REFERENCES products(code)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS transactions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,            -- ISO datetime
+            tdate TEXT NOT NULL,         -- YYYY-MM-DD
+            ttype TEXT NOT NULL,         -- BUY / SELL
+            product_code TEXT NOT NULL,
+            qty REAL NOT NULL,
+            unit_price REAL NOT NULL,    -- TL
+            note TEXT,
+            FOREIGN KEY(product_code) REFERENCES products(code)
+        )
+        """)
+        # ürünleri yükle
+        cur.execute("SELECT COUNT(1) FROM products")
+        if cur.fetchone()[0] == 0:
+            cur.executemany("INSERT INTO products(code,name,unit) VALUES(?,?,?)", PRODUCTS)
+        # opening satırları yoksa ekle
+        cur.execute("SELECT COUNT(1) FROM opening")
+        if cur.fetchone()[0] < len(PRODUCTS):
+            existing = {r[0] for r in cur.execute("SELECT product_code FROM opening").fetchall()}
+            missing = [(p[0], 0.0, 0.0) for p in PRODUCTS if p[0] not in existing]
+            if missing:
+                cur.executemany("INSERT INTO opening(product_code,qty,unit_cost) VALUES(?,?,?)", missing)
+        c.commit()
+
+def df_products() -> pd.DataFrame:
+    with closing(conn()) as c:
+        return pd.read_sql_query("SELECT code,name,unit FROM products ORDER BY rowid", c)
+
+def get_opening() -> pd.DataFrame:
+    with closing(conn()) as c:
+        q = """
+        SELECT p.code, p.name, p.unit, o.qty, o.unit_cost
+        FROM opening o JOIN products p ON p.code=o.product_code
+        ORDER BY p.rowid
+        """
+        return pd.read_sql_query(q, c)
+
+def save_opening(df: pd.DataFrame):
+    with closing(conn()) as c, c, closing(c.cursor()) as cur:
+        for _, r in df.iterrows():
+            cur.execute(
+                "UPDATE opening SET qty=?, unit_cost=? WHERE product_code=?",
+                (float(r["qty"] or 0), float(r["unit_cost"] or 0), r["code"])
             )
-        """))
-        c.execute(text("""
-            CREATE TABLE IF NOT EXISTS transactions(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT,
-                product TEXT,
-                ttype TEXT,       -- Alış / Satış
-                unit  TEXT,
-                qty_or_gram REAL,
-                unit_price REAL,
-                total REAL,
-                note TEXT
-            )
-        """))
-    return eng
+        c.commit()
 
-engine = get_engine()
+def add_txn(tdate: date, ttype: str, product_code: str, qty: float, unit_price: float, note: str = ""):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with closing(conn()) as c, c, closing(c.cursor()) as cur:
+        cur.execute("""
+            INSERT INTO transactions(ts,tdate,ttype,product_code,qty,unit_price,note)
+            VALUES(?,?,?,?,?,?,?)
+        """, (ts, tdate.isoformat(), ttype, product_code, qty, unit_price, note))
+        c.commit()
 
-def save_prices_if_changed(rows: list[dict]):
-    """rows: [{'name': 'Eski Çeyrek', 'buy': 9500, 'sell': 9650}, ...]"""
-    if not rows: return 0
-    # Son kayda göre değişenleri yaz
-    inserted = 0
-    with engine.begin() as c:
-        for r in rows:
-            df = pd.read_sql(text("""
-                SELECT buy, sell FROM prices
-                WHERE source='HAREM' AND name=:n
-                ORDER BY datetime(ts) DESC LIMIT 1
-            """), c, params={"n": r["name"]})
-            changed = True
-            if not df.empty:
-                last_buy, last_sell = float(df.iloc[0]["buy"]), float(df.iloc[0]["sell"])
-                changed = not (abs(last_buy - r["buy"]) < 1e-6 and abs(last_sell - r["sell"]) < 1e-6)
-            if changed:
-                c.execute(text("""
-                    INSERT INTO prices(source,name,buy,sell,ts)
-                    VALUES('HAREM', :n, :b, :s, :ts)
-                """), {"n": r["name"], "b": float(r["buy"]), "s": float(r["sell"]),
-                       "ts": dt.datetime.utcnow().isoformat(timespec="seconds")})
-                inserted += 1
-    return inserted
-
-def read_latest_harem_map() -> dict:
-    """En güncel Harem kayıtlarını {ad: {'buy':..,'sell':..}} döndürür."""
-    with engine.begin() as c:
-        df = pd.read_sql(text("""
-            SELECT name, buy, sell, MAX(ts) as ts
-            FROM prices
-            WHERE source='HAREM'
-            GROUP BY name
-        """), c)
-    out = {}
-    for _, r in df.iterrows():
-        out[str(r["name"])] = {"buy": float(r["buy"]), "sell": float(r["sell"])}
-    return out
-
-# ============== HAREM ÇEKME ==============
-def _normalize_num(s: str) -> float:
-    s = re.sub(r"[^\d.,-]", "", s or "")
-    if "." in s and "," in s:
-        # son ayırıcıyı ondalık kabul et
-        if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    else:
-        if "," in s:
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            # 12.345.678 -> 12345678
-            if re.match(r"^\d{1,3}(\.\d{3})+(\.\d+)?$", s):
-                s = s.replace(".", "")
-    return float(s)
-
-def _parse_cards(html: str) -> dict:
-    """
-    Harem ana sayfadaki kartlardan ESKİ ÇEYREK/GRAM ALTIN...” metinlerini ve
-    yakınındaki alış/satış sayılarını çeker (heuristic).
-    """
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True).upper()
-    found = {}
-    # Her ürün için, sayfada geçen bloklardan iki sayı yakalamaya çalışalım.
-    for prod, meta in PRODUCTS.items():
-        aliases = meta["harem_alias"]
-        if any(a in text for a in aliases):
-            # Bu basitleştirilmiş yöntem tüm sayfayı tarar ve yakın sayı dizilerini alır.
-            # Daha sağlamı: alias geçen bloklara göre local parse. (Gerektiğinde daraltırız.)
-            nums = re.findall(r"[-+]?\d{1,3}(?:[.\s]?\d{3})*(?:[.,]\d+)?", text)
-            # İlk iki makul sayı: alış, satış varsayımı
-            vals = []
-            for n in nums:
-                try:
-                    vals.append(_normalize_num(n))
-                except:
-                    pass
-            # Eğer çok fazla sayı varsa, yine de ilk iki mantıklı değeri alıyoruz.
-            if len(vals) >= 2:
-                found[prod] = {"buy": float(vals[0]), "sell": float(vals[1])}
-    return found
-
-def fetch_harem_prices() -> dict:
-    """
-    1) Requests ile hızlı çek.
-    2) Veri gelmezse (JS) Playwright ile render ederek DOM'dan oku.
-    Dönen: {'Çeyrek Altın': {'buy':..,'sell':..}, ...}   (ürün isimleri bizim sözlükteki key'ler)
-    """
-    import requests
-    try:
-        r = requests.get(HAREM_URL, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
-        r.raise_for_status()
-        quick = _parse_cards(r.text)
-        if quick:
-            return quick
-    except Exception:
-        pass
-
-    # Playwright fallback
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context(user_agent="Mozilla/5.0")
-            page = ctx.new_page()
-            page.goto(HAREM_URL, wait_until="domcontentloaded", timeout=15_000)
-            page.wait_for_timeout(2500)  # JS fiyat yüklenmesi için kısa bekleme
-            html = page.content()
-            browser.close()
-        slow = _parse_cards(html)
-        return slow
-    except Exception:
-        return {}
-
-# ============== MARJLI FİYAT HESABI ==============
-def compute_our_prices(harem_map: dict) -> pd.DataFrame:
-    """
-    harem_map: {'Çeyrek Altın': {'buy':..,'sell':..}, ...}
-    return DataFrame: product | harem_buy | harem_sell | our_buy | our_sell
-    """
-    rows = []
-    for prod, meta in PRODUCTS.items():
-        hm = harem_map.get(prod) or {}
-        hb, hs = hm.get("buy"), hm.get("sell")
-        rb = rs = None
-        rule = MARGINS.get(prod)
-        if rule and hb is not None and hs is not None:
-            # alış
-            ref_b = hb if rule["buy_from"] == "buy" else hs
-            rb = ref_b + rule["buy_delta"]
-            # satış
-            ref_s = hb if rule["sell_from"] == "buy" else hs
-            rs = ref_s + rule["sell_delta"]
-        rows.append([prod, hb, hs, rb, rs])
-    df = pd.DataFrame(rows, columns=["Ürün","Harem Alış","Harem Satış","Bizim Alış","Bizim Satış"])
-    return df
-
-# ============== TRANSACTIONS/ENVANTER ==============
-def write_tx(product, ttype, qty, unit_price, note=""):
-    unit = PRODUCTS[product]["unit"]
-    total = qty * unit_price
-    with engine.begin() as c:
-        c.execute(text("""
-            INSERT INTO transactions(date, product, ttype, unit, qty_or_gram, unit_price, total, note)
-            VALUES(:d,:p,:t,:u,:q,:up,:tot,:n)
-        """), {
-            "d": dt.datetime.now().isoformat(timespec="seconds"),
-            "p": product, "t": ttype, "u": unit,
-            "q": float(qty), "up": float(unit_price), "tot": float(total), "n": note or ""
-        })
-
-def read_tx(limit=200):
-    return pd.read_sql(text("""
-        SELECT date, product, ttype, unit, qty_or_gram AS qty, unit_price, total, note
+def get_txns(limit: int = 500) -> pd.DataFrame:
+    with closing(conn()) as c:
+        q = """
+        SELECT id, ts, tdate, ttype, product_code, qty, unit_price, note
         FROM transactions
-        ORDER BY datetime(date) DESC
-        LIMIT :lim
-    """), engine, params={"lim": limit})
+        ORDER BY ts DESC, id DESC
+        LIMIT ?
+        """
+        return pd.read_sql_query(q, c, params=(limit,))
 
-def inventory_summary():
-    df = read_tx(10_000)
-    if df.empty:
-        return pd.DataFrame(columns=["Ürün","Stok","Birim"])
-    rows = []
-    for prod, meta in PRODUCTS.items():
-        unit = meta["unit"]
-        x = df[df["product"] == prod]
-        qty = x.apply(lambda r: r["qty"] if r["ttype"]=="Alış" else -r["qty"], axis=1).sum()
-        rows.append([prod, round(qty,3), unit])
-    return pd.DataFrame(rows, columns=["Ürün","Stok","Birim"])
+def delete_txn(row_id: int):
+    with closing(conn()) as c, c, closing(c.cursor()) as cur:
+        cur.execute("DELETE FROM transactions WHERE id=?", (row_id,))
+        c.commit()
 
-def cash_summary():
-    df = read_tx(10_000)
-    if df.empty: return 0.0
-    df["signed"] = df["total"] * df["ttype"].map({"Alış": -1, "Satış": +1})
-    return float(df["signed"].sum())
+# ============ HESAPLAMA ============
+def to_float(x) -> float:
+    if x is None: return 0.0
+    if isinstance(x, (int, float)): return float(x)
+    s = str(x).strip()
+    s = s.replace(".", "").replace(",", ".") if s.count(",") and s.count(".") >= 1 else s.replace(",", ".")
+    try:
+        return float(s)
+    except:
+        return 0.0
 
-# ============== OTO-REFRESH (her 30 sn) ==============
-# Bu çağrı app'i periyodik yeniler; her yenilemede Harem çekimi tetiklenir.
-st.autorefresh = st.experimental_rerun  # backward safety (eğer bazı ortamlar eskiyse)
-try:
-    from streamlit.runtime.scriptrunner.script_run_context import add_script_run_ctx  # no-op, sadece import guard
-except:
-    pass
-st_autorefresh = st.experimental_rerun  # guard
-try:
-    from streamlit import runtime
-    _ = st.runtime  # guard
-except:
-    pass
-try:
-    st.experimental_set_query_params(_=int(dt.datetime.utcnow().timestamp()))  # cache-breaker hint
-except:
-    pass
-st.autorefresh_counter = st.session_state.get("autorefresh_counter_v1", 0)
-st.session_state["autorefresh_counter_v1"] = st.autorefresh_counter + 1
-st.experimental_singleton = None  # ensure no legacy caching issues
+def chronological_txns() -> pd.DataFrame:
+    with closing(conn()) as c:
+        q = """
+        SELECT ts, tdate, ttype, product_code, qty, unit_price
+        FROM transactions
+        ORDER BY ts ASC, id ASC
+        """
+        return pd.read_sql_query(q, c)
 
-# Streamlit'in resmi fonksiyonu:
-try:
-    from streamlit import autorefresh as _st_autorefresh
-except Exception:
-    _st_autorefresh = None
-if _st_autorefresh:
-    _st_autorefresh(interval=AUTO_REFRESH_MS, key="auto_refresh_v1")
+def running_avg_pnl() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Satışta kâr = (satış_birim_fiyat - o andaki ağırlıklı ort. maliyet) * qty
+    Envanter = açılış + alışlar - satışlar; son ort. maliyet de ağırlıklı ortalama
+    """
+    prods = df_products().set_index("code")[["name", "unit"]]
+    opening = get_opening().set_index("code")[["qty", "unit_cost"]]
 
-# ============== ANA AKIŞ: HAREM'İ OTOMATİK ÇEK & DB'YE YAZ ==============
-with st.spinner("Harem fiyatları kontrol ediliyor..."):
-    data = fetch_harem_prices()
-    if data:
-        # Harem ham verisini DB'ye (değiştiyse) yaz
-        rows = []
-        for prod, vals in data.items():
-            # 'data' dict anahtarları bizim ürün adlarımız (Çeyrek Altın, 24 Ayar Gram...)
-            # Harem adını da bizim anahtar ismi gibi saklıyoruz.
-            rows.append({"name": prod, "buy": float(vals.get("buy", 0)), "sell": float(vals.get("sell", 0))})
-        inserted = save_prices_if_changed(rows)
-        if inserted > 0:
-            st.toast(f"Harem güncellendi ({inserted} kalem).", icon="🔄")
-    else:
-        st.warning("Harem verisi alınamadı (ağ/JS engeli olabilir). Playwright kurulumu gerekli olabilir.")
+    # state: avg_cost & qty per product
+    state_qty: Dict[str, float] = {code: float(opening.loc[code, "qty"]) if code in opening.index else 0.0
+                                   for code in prods.index}
+    state_cost: Dict[str, float] = {code: float(opening.loc[code, "unit_cost"]) if code in opening.index else 0.0
+                                    for code in prods.index}
 
-# ============== UI ==============
-st.title("💎 Sarıkaya Kuyumculuk — Otomatik Harem Entegrasyonu")
+    # günlük özet satırları
+    pnl_rows = []  # date, sales, purchases, profit
+    inv_rows = []  # product, qty, avg_cost, value
 
-tabs = st.tabs(["📈 Canlı Fiyatlar", "💱 Alış / Satış", "🏦 Kasa & Envanter"])
+    # işlemleri gün gün gez
+    tx = chronological_txns()
+    if tx.empty:
+        # envanteri sadece açılışla hesapla
+        for code in prods.index:
+            q = state_qty[code]
+            ac = state_cost[code]
+            inv_rows.append([code, prods.loc[code, "name"], prods.loc[code, "unit"], q, ac, q * ac])
+        pnl_df = pd.DataFrame(columns=["tarih", "toplam_alış", "toplam_satış", "günlük_kâr"])
+        inv_df = pd.DataFrame(inv_rows, columns=["code", "ürün", "birim", "kalan_miktar", "ort_maliyet", "envanter_değeri"])
+        return pnl_df, inv_df
 
-# ---- Canlı Fiyatlar ----
-with tabs[0]:
-    st.subheader("Canlı Fiyatlar (Harem → Bizim Marj)")
-    latest = read_latest_harem_map()
-    df_live = compute_our_prices(latest)
-    st.dataframe(df_live.style.format({
-        "Harem Alış":"{:,.2f}", "Harem Satış":"{:,.2f}",
-        "Bizim Alış":"{:,.2f}", "Bizim Satış":"{:,.2f}",
-    }), use_container_width=True, height=320)
+    current_day = None
+    day_purchases = 0.0
+    day_sales = 0.0
+    day_profit = 0.0
 
-    st.caption(f"Son güncelleme: {dt.datetime.now().strftime('%H:%M:%S')} • Her {AUTO_REFRESH_MS//1000} sn’de otomatik yenilenir.")
+    for _, r in tx.iterrows():
+        d = r["tdate"]
+        if current_day is None:
+            current_day = d
+        if d != current_day:
+            pnl_rows.append([current_day, day_purchases, day_sales, day_profit])
+            current_day = d
+            day_purchases = day_sales = day_profit = 0.0
 
-# ---- Alış / Satış ----
-with tabs[1]:
-    st.subheader("Alış / Satış İşlemi (Öneri fiyat otomatik)")
-    col1, col2, col3 = st.columns([2,2,2])
-    with col1:
-        product = st.selectbox("Ürün", list(PRODUCTS.keys()), key="tx_prod_v1")
-    with col2:
-        ttype = st.radio("Tür", ["Alış","Satış"], horizontal=True, key="tx_type_v1")
-    with col3:
-        unit = PRODUCTS[product]["unit"]
-        step = 1.0 if unit=="adet" else 0.10
-        qty = st.number_input("Miktar", min_value=0.01, value=1.0, step=step, key="tx_qty_v1")
+        code = r["product_code"]
+        qty = to_float(r["qty"])
+        price = to_float(r["unit_price"])
 
-    # Öneri fiyat: bizim marjlı tabloya göre
-    row = df_live[df_live["Ürün"] == product]
-    suggested = 0.0
-    if not row.empty:
-        suggested = float(row.iloc[0]["Bizim Alış" if ttype=="Alış" else "Bizim Satış"])
-    st.markdown("##### Önerilen Birim Fiyat")
-    st.markdown(f"<div style='font-size:28px;font-weight:700'>{suggested:,.2f} ₺</div>", unsafe_allow_html=True)
+        if r["ttype"] == "BUY":
+            # yeni ortalama maliyet
+            old_q, old_c = state_qty[code], state_cost[code]
+            new_q = old_q + qty
+            if new_q <= 0:
+                # tüm stok bitmişse maliyeti aynı bırak
+                state_qty[code] = 0.0
+            else:
+                new_cost = (old_q * old_c + qty * price) / new_q
+                state_cost[code] = new_cost
+                state_qty[code] = new_q
+            day_purchases += qty * price
+        else:  # SELL
+            ac = state_cost[code]
+            state_qty[code] = max(0.0, state_qty[code] - qty)
+            sale_total = qty * price
+            cogs = qty * ac
+            day_sales += sale_total
+            day_profit += (sale_total - cogs)
 
-    manual = st.number_input("Birim Fiyat (manuel değiştirebilirsiniz)", value=float(round(suggested,2)), step=1.0, key="tx_price_v1")
-    total = manual * qty
-    st.success(f"Toplam: {total:,.2f} ₺")
+    # son gün
+    if current_day is not None:
+        pnl_rows.append([current_day, day_purchases, day_sales, day_profit])
 
-    note = st.text_input("Not (opsiyonel)", key="tx_note_v1")
-    if st.button("Kaydet", type="primary", key="tx_save_v1"):
-        try:
-            write_tx(product, ttype, qty, manual, note)
-            st.success("İşlem kaydedildi.")
-        except Exception as e:
-            st.error(f"Hata: {e}")
+    # envanter tablosu
+    for code in prods.index:
+        q = state_qty[code]
+        ac = state_cost[code]
+        inv_rows.append([code, prods.loc[code, "name"], prods.loc[code, "unit"], q, ac, q * ac])
+
+    pnl_df = pd.DataFrame(pnl_rows, columns=["tarih", "toplam_alış", "toplam_satış", "günlük_kâr"])
+    pnl_df["tarih"] = pd.to_datetime(pnl_df["tarih"]).dt.date
+    pnl_df["kümülatif_kâr"] = pnl_df["günlük_kâr"].cumsum()
+
+    inv_df = pd.DataFrame(inv_rows, columns=["code", "ürün", "birim", "kalan_miktar", "ort_maliyet", "envanter_değeri"])
+    inv_df = inv_df.sort_values("ürün")
+    return pnl_df, inv_df
+
+def cash_balance(pnl_df: pd.DataFrame) -> float:
+    # kasa = satışlar - alışlar (açılış stokları kasayı etkilemez)
+    return float(pnl_df["toplam_satış"].sum() - pnl_df["toplam_alış"].sum()) if not pnl_df.empty else 0.0
+
+# ============ UI BİLEŞENLERİ ============
+
+def header():
+    st.markdown("## 💎 Sarıkaya Kuyumculuk — Kâr/Zarar & Envanter")
+    st.caption("Sade panel: Alış/Satış kayıt, günlük kâr hesap, envanter özeti. (Harem/Özbağ entegrasyonu yok)")
+
+def tab_islem():
+    st.markdown("### 🧾 İşlem Girişi (Alış / Satış)")
+    prods = df_products()
+    colA, colB, colC, colD = st.columns([2, 1, 1, 2])
+
+    with st.form("txn_form", clear_on_submit=False):
+        with colA:
+            product = st.selectbox("Ürün", prods["name"].tolist(), index=4, key="txn_prod")
+        with colB:
+            ttype = st.radio("Tür", ["Satış", "Alış"], horizontal=True, key="txn_type")
+        with colC:
+            qty = st.number_input("Miktar", min_value=0.00, step=1.00, value=1.00, format="%.2f", key="txn_qty")
+        with colD:
+            unit_price = st.text_input("Birim Fiyat (₺)", value="0", key="txn_price")
+
+        tdate = st.date_input("Tarih", value=date.today(), key="txn_date")
+        note = st.text_input("Not (opsiyonel)", key="txn_note")
+        submitted = st.form_submit_button("Kaydet", use_container_width=True)
+
+    if submitted:
+        code = prods.loc[prods["name"] == product, "code"].iloc[0]
+        add_txn(tdate, "BUY" if ttype == "Alış" else "SELL", code, to_float(qty), to_float(unit_price), note)
+        st.success("İşlem kaydedildi.")
 
     st.markdown("#### Son İşlemler")
-    st.dataframe(read_tx(50).style.format({"qty":"{:,.3f}","unit_price":"{:,.2f}","total":"{:,.2f}"}),
-                 use_container_width=True, height=320)
+    tx = get_txns(200)
+    if tx.empty:
+        st.info("Henüz işlem yok.")
+    else:
+        show = tx.rename(columns={
+            "ts": "zaman", "tdate": "tarih", "ttype": "tür", "product_code": "ürün_kodu",
+            "qty": "miktar", "unit_price": "birim_fiyat", "note": "not"
+        })
+        st.dataframe(show, use_container_width=True, height=300)
+        col1, col2 = st.columns(2)
+        with col1:
+            rid = st.number_input("Silinecek işlem id", min_value=0, step=1, value=0, format="%d")
+        with col2:
+            if st.button("İşlemi Sil"):
+                if rid > 0:
+                    delete_txn(int(rid))
+                    st.success("Silindi. Yenilemek için sayfayı tazele.")
+                else:
+                    st.warning("Geçerli bir ID gir.")
 
-# ---- Kasa & Envanter ----
-with tabs[2]:
-    st.subheader("Kasa & Envanter")
-    st.metric("Kasa Bakiyesi", f"{cash_summary():,.2f} ₺")
-    st.markdown("### Envanter Özeti")
-    st.dataframe(inventory_summary().style.format({"Stok":"{:,.3f}"}), use_container_width=True, height=300)
+def tab_envanter():
+    st.markdown("### 📦 Envanter & Kasa Özeti")
+    pnl_df, inv_df = running_avg_pnl()
+    kasa = cash_balance(pnl_df)
+    col1, col2, col3 = st.columns(3)
+    with col1: st.metric("Kasa (TL)", f"{kasa:,.2f}".replace(",", "."))
+    with col2: st.metric("Toplam Envanter Değeri (TL)", f"{inv_df['envanter_değeri'].sum():,.2f}".replace(",", "."))
+    with col3: 
+        toplam_kar = pnl_df["günlük_kâr"].sum() if not pnl_df.empty else 0.0
+        st.metric("Toplam Kâr (Açılıştan bugüne)", f"{toplam_kar:,.2f}".replace(",", "."))
+
+    st.markdown("#### Envanter Detayı (ağırlıklı ort. maliyet)")
+    inv_show = inv_df.rename(columns={
+        "ürün": "Ürün", "birim": "Birim", "kalan_miktar": "Kalan",
+        "ort_maliyet": "Ort. Maliyet", "envanter_değeri": "Değer (TL)"
+    })[["Ürün", "Birim", "Kalan", "Ort. Maliyet", "Değer (TL)"]]
+    st.dataframe(inv_show, use_container_width=True, height=340)
+
+def tab_kar_zarar():
+    st.markdown("### 📈 Günlük Kâr / Zarar")
+    pnl_df, _ = running_avg_pnl()
+    if pnl_df.empty:
+        st.info("Henüz işlem yok.")
+        return
+    show = pnl_df.rename(columns={
+        "tarih": "Tarih",
+        "toplam_alış": "Toplam Alış",
+        "toplam_satış": "Toplam Satış",
+        "günlük_kâr": "Günlük Kâr",
+        "kümülatif_kâr": "Kümülatif Kâr"
+    })
+    st.dataframe(show, use_container_width=True, height=340)
+
+def tab_acilis():
+    st.markdown("### 🧰 Açılış Stokları")
+    df = get_opening()[["code", "name", "unit", "qty", "unit_cost"]].rename(
+        columns={"code":"code", "name":"ürün", "unit":"birim", "qty":"qty", "unit_cost":"unit_cost"}
+    )
+    st.caption("İpucu: Virgül veya nokta kullanabilirsiniz; sistem otomatik düzeltir.")
+    edit = st.data_editor(
+        df,
+        use_container_width=True,
+        num_rows="fixed",
+        hide_index=True,
+        column_config={
+            "code": st.column_config.TextColumn("Kod", disabled=True),
+            "ürün": st.column_config.TextColumn("Ürün", disabled=True),
+            "birim": st.column_config.TextColumn("Birim", disabled=True),
+            "qty": st.column_config.NumberColumn("Miktar", step=0.01, format="%.3f"),
+            "unit_cost": st.column_config.NumberColumn("Birim Maliyet (TL)", step=0.01, format="%.2f"),
+        },
+        key="opening_editor",
+        height=360
+    )
+    if st.button("Açılış Stoklarını Kaydet", use_container_width=True):
+        # numeric düzelt
+        tmp = edit.copy()
+        tmp["qty"] = tmp["qty"].map(to_float)
+        tmp["unit_cost"] = tmp["unit_cost"].map(to_float)
+        save_opening(tmp.rename(columns={"ürün":"name","birim":"unit"}))
+        st.success("Açılış stokları güncellendi.")
+
+# ============ ANA ============
+def main():
+    ensure_db()
+    header()
+    t1, t2, t3, t4 = st.tabs(["🧾 Alış / Satış", "📦 Envanter & Kasa", "📈 Kâr/Zarar", "🧰 Açılış Stokları"])
+    with t1: tab_islem()
+    with t2: tab_envanter()
+    with t3: tab_kar_zarar()
+    with t4: tab_acilis()
+
+if __name__ == "__main__":
+    main()

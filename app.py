@@ -366,3 +366,155 @@ with st.expander("🧾 Stok Düzeltme / Güncelleme"):
                 }]
                 write_opening_stock(rows)
                 st.success(f"{selected_product} stoku {current_qty} → {new_qty} olarak güncellendi.")
+                # --- TOPLU STOK GÜNCELLE (CSV/METİN) ---
+with st.expander("📥 Toplu Stok Güncelle (CSV / metin ile)", expanded=False):
+    st.caption("Biçim: `Ürün Adı, Yeni Stok`  • Örnek: `Çeyrek Altın, 12.5`")
+    st.caption("Türkçe ondalık virgül de kabul edilir (örn: 12,5). Her satır bir üründür.")
+
+    # mevcut envanteri çek
+    inv_df = inventory_summary()
+    if inv_df.empty:
+        st.info("Henüz stok yok.")
+    else:
+        sample = "\n".join([f"{p}, {float(inv_df.loc[inv_df['product']==p,'qty_net'].values[0]):.2f}"
+                            for p in inv_df['product'].tolist()[:3]])
+        bulk_txt = st.text_area("CSV'yi buraya yapıştırın", value=sample, height=140, key="bulk_csv_text")
+
+        colu, colp = st.columns([1,1])
+        uploaded = colu.file_uploader("Veya dosya yükle (.csv / .txt)", type=["csv","txt"], key="bulk_csv_file")
+        apply_btn = colp.button("Güncellemeyi Uygula", type="primary", key="bulk_apply_btn")
+
+        # metin + dosyayı birleştir
+        raw = ""
+        if bulk_txt.strip():
+            raw += bulk_txt.strip() + "\n"
+        if uploaded is not None:
+            raw += uploaded.read().decode("utf-8", errors="ignore")
+
+        # satırları ayrıştır
+        def parse_lines(text: str):
+            lines = []
+            for ln in text.splitlines():
+                s = ln.strip()
+                if not s:
+                    continue
+                # ; veya , ayracı destekle
+                sep = "," if "," in s else ";"
+                try:
+                    name, qty = s.split(sep, 1)
+                except ValueError:
+                    continue
+                name = name.strip()
+                qty_s = qty.strip().replace(".", "").replace(",", ".")  # 12,5 -> 12.5 ; 1.234,56 -> 1234.56
+                try:
+                    q = float(qty_s)
+                except:
+                    continue
+                lines.append((name, q))
+            return lines
+
+        parsed = parse_lines(raw) if raw else []
+        if parsed:
+            st.write("Önizleme:")
+            st.dataframe(
+                pd.DataFrame(parsed, columns=["product", "new_qty"]),
+                use_container_width=True, hide_index=True,
+            )
+
+        if apply_btn:
+            if not parsed:
+                st.warning("Geçerli satır bulunamadı.")
+            else:
+                # ad eşleştirme: en yakın eşleşmeyi bul (tam eşleşme yoksa)
+                def best_match(name, choices):
+                    exact = [c for c in choices if c.lower() == name.lower()]
+                    if exact:
+                        return exact[0]
+                    # çok basit bir skorlayıcı: alt string / baş harf vs.
+                    name_l = name.lower()
+                    scored = sorted(choices, key=lambda c: (0 if name_l in c.lower() else 1, abs(len(c)-len(name))))
+                    return scored[0]
+
+                product_list = inv_df["product"].tolist()
+                ops = []
+                for name, new_qty in parsed:
+                    matched = best_match(name, product_list)
+                    current = float(inv_df.loc[inv_df["product"]==matched,"qty_net"].values[0])
+                    diff = new_qty - current
+                    if diff == 0:
+                        continue
+                    unit = PRODUCTS[matched]["unit"]
+                    has_diff = to_has_grams(matched, abs(diff))
+                    rows = [{
+                        "ts": dt.datetime.utcnow().isoformat(timespec="seconds"),
+                        "product": matched,
+                        "unit": unit,
+                        "qty": diff,
+                        "qty_grams": has_diff * (1 if diff > 0 else -1),
+                        "note": f"Toplu stok düzeltme (önce: {current}, sonra: {new_qty})"
+                    }]
+                    ops.append({"product": matched, "before": current, "after": new_qty, "diff": diff})
+
+                    # envanter düzeltmesini opening_stock'a yaz
+                    write_opening_stock(rows)
+
+                if ops:
+                    st.success(f"{len(ops)} ürün güncellendi.")
+                    st.dataframe(pd.DataFrame(ops), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Değişiklik gerektiren satır yoktu.")
+                    # --- STOK HAREKET GEÇMİŞİ ---
+with st.expander("📜 Stok Hareket Geçmişi", expanded=False):
+    st.caption("Açılış/ düzeltme hareketleri ve işlemler (alış/satış) bir arada gösterilir.")
+
+    # veriyi çek
+    def _safe_read(tbl):
+        try:
+            return read_sql(tbl)
+        except Exception:
+            return pd.DataFrame()
+
+    tx = _safe_read("transactions")           # beklenen kolonlar: ts, product, ttype, unit, qty, qty_grams, note
+    op = _safe_read("opening_stock")          # beklenen kolonlar: ts, product, unit, qty, qty_grams, note
+
+    # normalize alanlar
+    if not op.empty:
+        op = op.copy()
+        op["ttype"] = op.get("ttype", "Düzeltme")
+    if not tx.empty:
+        tx = tx.copy()
+        tx["ttype"] = tx["ttype"].fillna("İşlem")
+
+    all_df = pd.concat([op, tx], ignore_index=True) if not (op.empty and tx.empty) else pd.DataFrame()
+    if all_df.empty:
+        st.info("Henüz hareket kaydı yok.")
+    else:
+        # tarih biçimle
+        all_df["ts"] = pd.to_datetime(all_df["ts"], errors="coerce")
+        all_df = all_df.sort_values("ts", ascending=False)
+
+        # filtreler
+        products = ["(Tümü)"] + sorted(all_df["product"].dropna().unique().tolist())
+        sel_prod = st.selectbox("Ürün", products, key="hist_prod")
+        today = dt.date.today()
+        d1, d2 = st.date_input(
+            "Tarih aralığı",
+            value=(today - dt.timedelta(days=14), today),
+            key="hist_dates"
+        )
+        f = all_df
+        if sel_prod != "(Tümü)":
+            f = f[f["product"] == sel_prod]
+        if isinstance(d1, dt.date) and isinstance(d2, dt.date):
+            start = dt.datetime.combine(d1, dt.time.min)
+            end   = dt.datetime.combine(d2, dt.time.max)
+            f = f[(f["ts"] >= start) & (f["ts"] <= end)]
+
+        # özet
+        col1, col2 = st.columns(2)
+        col1.metric("Toplam Miktar (qty)", f["qty"].sum() if "qty" in f else 0)
+        col2.metric("Toplam Has (gr)", f["qty_grams"].sum() if "qty_grams" in f else 0)
+
+        # tablo
+        show_cols = [c for c in ["ts","ttype","product","unit","qty","qty_grams","note"] if c in f.columns]
+        st.dataframe(f[show_cols], use_container_width=True, hide_index=True)

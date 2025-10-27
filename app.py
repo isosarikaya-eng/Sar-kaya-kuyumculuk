@@ -93,8 +93,10 @@ with tabs[1]:
             toplam = fiyat * miktar
             st.metric(label="Önerilen Fiyat", value=f"{fiyat:,.2f} ₺")
             st.success(f"Toplam: {toplam:,.2f} ₺")
-            if tür == "Satış" and st.session_state["harem_df"].iloc[0]["buy"] > fiyat:
-                st.error("⚠️ Satış fiyatı alış fiyatının altında olamaz!")
+            # Doğru ürün için alış fiyatını bul
+alış_fiyatı = fiyat_getir(st.session_state["harem_df"], ürün, "Alış")
+if tür == "Satış" and alış_fiyatı and fiyat < alış_fiyatı:
+    st.error(f"⚠️ Satış fiyatı ({fiyat:,.2f} ₺), alış fiyatı ({alış_fiyatı:,.2f} ₺) altında olamaz!")
         else:
             st.error("⚠️ Fiyat bulunamadı.")
 

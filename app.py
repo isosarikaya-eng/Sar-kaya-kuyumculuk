@@ -1,352 +1,377 @@
-# app.py
-# -*- coding: utf-8 -*-
+# app.py — Sarıkaya Kuyumculuk (sıfırdan)
+# Streamlit 1.38+  / Python 3.12+
+# - Harem & Özbağ CSV içeri al
+# - Marj kuralı: Gram altın = Harem Satış -20 (alış) / +10 (satış)
+# - Eski Çeyrek / Yarım / Tam / Ata = Harem “Eski …” satırına göre
+# - İşlem (alış/satış) paneli: canlı öneri (10 sn’de bir yeniden hesap)
+# - Envanter (has bazlı özet) + Kasa ekranı
+# - Özbağ tedarikçisi için borç/has takibi (+ 22 ayar bilezik girişleri)
 
+from __future__ import annotations
 import io
+import sqlite3
 import datetime as dt
-from typing import Optional, Dict, List
+from typing import Optional, List, Dict
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship
-from sqlalchemy import Column, Integer, Float, String, Date, DateTime, Text, ForeignKey
 
-# ==================== Veritabanı ====================
-DB_URL = "sqlite:///sarikaya_kuyum.db"
-engine = create_engine(DB_URL, echo=False, future=True)
-Session = sessionmaker(bind=engine)
-Base = declarative_base()
+DB_PATH = "sar_kaya.db"
 
-class Price(Base):
-    __tablename__ = "prices"
-    id = Column(Integer, primary_key=True)
-    source = Column(String)        # "HAREM" | "OZBAG"
-    name = Column(String)          # "Eski Çeyrek" | "Gram Altın" | ...
-    buy = Column(Float, nullable=True)   # Harem için: alış TL; Özbağ için boş
-    sell = Column(Float, nullable=True)  # Harem için: satış TL; Özbağ için boş
-    has = Column(Float, nullable=True)   # Özbağ için: has çarpanı (örn 0.3520); Harem’de ops.
-    ts = Column(DateTime, default=dt.datetime.utcnow)
-
-class Transaction(Base):
-    __tablename__ = "transactions"
-    id = Column(Integer, primary_key=True)
-    date = Column(Date, default=dt.date.today)
-    product = Column(String)       # "Çeyrek Altın" vb.
-    ttype = Column(String)         # "Alış" | "Satış"
-    unit = Column(String)          # "adet" | "gram"
-    qty_or_gram = Column(Float)    # adet veya gram
-    price_tl = Column(Float)       # birim fiyat
-    note = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=dt.datetime.utcnow)
-
-class Setting(Base):
-    __tablename__ = "settings"
-    id = Column(Integer, primary_key=True)
-    product = Column(String, unique=True)    # ürün adı
-    buy_add = Column(Float, default=0.0)     # öneri alışa eklenecek (TL)
-    sell_add = Column(Float, default=0.0)    # öneri satışa eklenecek (TL)
-
-Base.metadata.create_all(engine)
-
-# ==================== Ürün Tanımları ====================
-PRODUCTS: Dict[str, Dict] = {
-    "Çeyrek Altın": {"unit": "adet", "std_weight": 1.75,  "purity": 0.916},
-    "Yarım Altın":  {"unit": "adet", "std_weight": 3.50,  "purity": 0.916},
-    "Tam Altın":    {"unit": "adet", "std_weight": 7.00,  "purity": 0.916},
-    "Ata Lira":     {"unit": "adet", "std_weight": 7.216, "purity": 0.916},
-    "24 Ayar Gram": {"unit": "gram", "std_weight": 1.00,  "purity": 0.995},
-}
-
-# Harem'de aranan adlar (öncelik sırası)
-HAREM_ALIASES: Dict[str, List[str]] = {
-    "Çeyrek Altın": ["Eski Çeyrek", "Çeyrek"],
-    "Yarım Altın":  ["Eski Yarım", "Yarım"],
-    "Tam Altın":    ["Eski Tam",   "Tam"],
-    "Ata Lira":     ["Eski Ata",   "Ata"],
-    "24 Ayar Gram": ["Gram Altın", "Has Altın", "24 Ayar Gram"],
-}
-
-# ==================== Yardımcılar ====================
-def read_df(sql: str, params: dict = None) -> pd.DataFrame:
-    with engine.begin() as conn:
-        return pd.read_sql(text(sql), conn, params=params or {})
+# ---------- yardımcılar ----------
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS prices(
+        source TEXT,
+        name   TEXT,
+        buy    REAL,
+        sell   REAL,
+        ts     TEXT
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS transactions(
+        date TEXT,
+        product TEXT,
+        ttype TEXT,         -- 'Alış' | 'Satış'
+        unit  TEXT,         -- 'adet' | 'gram'
+        qty_or_gram REAL,   -- adet->adet, gram->gram
+        unit_price REAL,    -- TL birim
+        total_tl   REAL,
+        note TEXT
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS ozbag_ledger(
+        date TEXT,
+        item TEXT,          -- 'Bilezik 22A' vb.
+        has_grams REAL,     -- (+) borç artar, (-) borç düşer
+        tl REAL,            -- bilgi amaçlı
+        note TEXT
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS settings(
+        key TEXT PRIMARY KEY,
+        val TEXT
+    )
+    """)
+    conn.commit()
+    return conn
 
 def write_df(table: str, df: pd.DataFrame):
-    with engine.begin() as conn:
-        df.to_sql(table, conn, if_exists="append", index=False)
+    conn = get_conn()
+    df.to_sql(table, conn, if_exists="append", index=False)
+    conn.close()
 
-def get_price(source: str, name: str) -> Optional[pd.Series]:
-    q = """
-        SELECT * FROM prices
-        WHERE source=:src AND name=:n
-        ORDER BY ts DESC
-        LIMIT 1
+def read_sql(q: str, params: dict | tuple | None = None) -> pd.DataFrame:
+    conn = get_conn()
+    df = pd.read_sql_query(q, conn, params=params)
+    conn.close()
+    return df
+
+def upsert_setting(key: str, val: str):
+    conn = get_conn()
+    conn.execute("INSERT INTO settings(key,val) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET val=excluded.val", (key, val))
+    conn.commit()
+    conn.close()
+
+def get_setting(key: str, default: str) -> str:
+    conn = get_conn()
+    cur = conn.execute("SELECT val FROM settings WHERE key=?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+# ---------- ürün/özellikler ----------
+PRODUCTS: Dict[str, Dict] = {
+    "Çeyrek Altın": {"unit": "adet", "std_weight": 1.75, "purity": 0.916},
+    "Yarım Altın" : {"unit": "adet", "std_weight": 3.50, "purity": 0.916},
+    "Tam Altın"   : {"unit": "adet", "std_weight": 7.00, "purity": 0.916},
+    "Ata Lira"    : {"unit": "adet", "std_weight": 7.216, "purity": 0.916},
+    "24 Ayar Gram": {"unit": "gram", "std_weight": 1.00, "purity": 0.995},
+    "22 Ayar Gram": {"unit": "gram", "std_weight": 1.00, "purity": 0.916},
+    "22 Ayar 0,5g": {"unit": "adet", "std_weight": 0.50, "purity": 0.916},
+    "22 Ayar 0,25g": {"unit":"adet","std_weight": 0.25, "purity": 0.916},
+}
+
+# Harem eş adları (Eski ... ve Gram Altın)
+HAREM_NAME_ALIASES = {
+    "Çeyrek Altın": ["Eski Çeyrek", "Çeyrek"],
+    "Yarım Altın" : ["Eski Yarım", "Yarım"],
+    "Tam Altın"   : ["Eski Tam", "Tam"],
+    "Ata Lira"    : ["Eski Ata", "Ata"],
+    "24 Ayar Gram": ["Gram Altın", "24 Ayar Gram"],
+}
+
+# ---------- CSV içe alma ----------
+def parse_simple_csv(txt: str, cols: List[str]) -> pd.DataFrame:
+    # sadelik: her satır "Ad, v1, v2" şeklinde
+    df = pd.read_csv(io.StringIO(txt), header=None)
+    if len(df.columns) != len(cols):
+        raise ValueError(f"Beklenen {len(cols)} sütun: {cols}")
+    df.columns = cols
+    return df
+
+def import_harem_csv(txt: str):
     """
-    df = read_df(q, {"src": source, "n": name})
-    if df.empty:
+    Beklenen CSV (örnek):
+    Eski Çeyrek,9516,9644
+    Eski Yarım,19100,19300
+    Eski Tam,38200,38600
+    Eski Ata,38400,38800
+    Gram Altın,5836.65,5924.87
+    """
+    df = parse_simple_csv(txt, ["name", "buy", "sell"])
+    df["source"] = "HAREM"
+    df["ts"] = dt.datetime.utcnow().isoformat(timespec="seconds")
+    # float düzeltme: virgüllü gelebilir
+    for c in ["buy", "sell"]:
+        df[c] = df[c].astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    write_df("prices", df[["source","name","buy","sell","ts"]])
+
+def import_ozbag_csv(txt: str):
+    """
+    Beklenen CSV (örnek, has çarpanı):
+    Çeyrek,0.3520
+    Yarım,0.7040
+    Tam,1.4080
+    Ata,1.4160
+    24 Ayar Gram,1.0000
+    """
+    df = parse_simple_csv(txt, ["name", "has"])
+    df["has"] = pd.to_numeric(df["has"], errors="coerce")
+    df["source"] = "OZBAG"
+    df["buy"] = None
+    df["sell"] = df["has"]   # referans olarak sell sütununa yazıyoruz (kolay okunsun)
+    df["ts"] = dt.datetime.utcnow().isoformat(timespec="seconds")
+    write_df("prices", df[["source","name","buy","sell","ts"]])
+
+# ---------- fiyat okuma & öneri ----------
+def get_price_by_any(src: str, candidates: List[str], which: str) -> Optional[float]:
+    # en güncel kaydı al
+    q = """
+    SELECT name, buy, sell, ts FROM prices
+    WHERE source = :src
+      AND name IN ({})
+    ORDER BY ts DESC
+    LIMIT 50
+    """.format(",".join(["?"]*len(candidates)))
+    params = (src, *candidates)
+    df = read_sql(q, params)
+    if df.empty: 
         return None
-    return df.iloc[0]
-
-def get_price_by_any(source: str, names: List[str], field: str) -> Optional[float]:
-    for n in names:
-        rec = get_price(source, n)
-        if rec is not None and pd.notna(rec.get(field)):
-            return float(rec[field])
-    return None
-
-def ensure_default_margins():
-    """Varsayılan marj kayıtlarını 1 kez oluşturur."""
-    sess = Session()
-    try:
-        for p in PRODUCTS.keys():
-            if not sess.query(Setting).filter(Setting.product == p).first():
-                # Varsayılanlar: gram için -20/+10; coinler için -50/+50
-                if p == "24 Ayar Gram":
-                    sess.add(Setting(product=p, buy_add= -20.0, sell_add= 10.0))
-                else:
-                    sess.add(Setting(product=p, buy_add= -50.0, sell_add= 50.0))
-        sess.commit()
-    finally:
-        sess.close()
-
-ensure_default_margins()
-
-def get_margins() -> pd.DataFrame:
-    return read_df("SELECT product, buy_add, sell_add FROM settings ORDER BY product")
-
-def save_margin(product: str, buy_add: float, sell_add: float):
-    with engine.begin() as conn:
-        conn.execute(
-            text("UPDATE settings SET buy_add=:b, sell_add=:s WHERE product=:p"),
-            {"b": buy_add, "s": sell_add, "p": product},
-        )
+    # listedeki ilk eşleşeni bul
+    for cand in candidates:
+        m = df[df["name"] == cand]
+        if not m.empty:
+            return float(m.iloc[0][which])
+    # yoksa en üsttekini ver
+    return float(df.iloc[0][which])
 
 def suggested_price(product_name: str, ttype: str) -> Optional[float]:
-    """
-    Öneri fiyat mantığı:
-    - 24 Ayar Gram: HAREM'de "Gram Altın" satışı baz; Alış = baz-20, Satış = baz+10 (sonra ürün marjı eklenir)
-    - Çeyrek/Yarım/Tam/Ata: HAREM'de "Eski ..." satışı baz; Alış = baz + buy_add; Satış = baz + sell_add
-      (varsayılan buy_add=-50, sell_add=+50)
-    """
-    aliases = HAREM_ALIASES.get(product_name, [product_name])
-
-    # Baz satış fiyatı (HAREM)
-    base_sell = get_price_by_any("HAREM", aliases, "sell")
+    # kaynaklar: HAREM (temel), Özbağ has çarpanı sadece bilgi
+    aliases = HAREM_NAME_ALIASES.get(product_name, [product_name])
+    base_sell = get_price_by_any("HAREM", aliases, "sell")  # Harem satış kolonunu baz alıyoruz
     if base_sell is None:
         return None
 
-    # Ürün marjları
-    mg = read_df(
-        "SELECT buy_add, sell_add FROM settings WHERE product=:p LIMIT 1",
-        {"p": product_name},
-    )
-    buy_add = float(mg.iloc[0]["buy_add"]) if not mg.empty else 0.0
-    sell_add = float(mg.iloc[0]["sell_add"]) if not mg.empty else 0.0
-
-    # Gram altın özel kural
+    # Gram altın özel marj: -20 / +10
     if product_name == "24 Ayar Gram":
-        buy_base = base_sell - 20.0
-        sell_base = base_sell + 10.0
-    else:
-        buy_base = base_sell     # coin alış/satış ikisi de satış bazından gidecek; marjlarla ayrışır
-        sell_base = base_sell
+        return base_sell - 20 if ttype == "Alış" else base_sell + 10
 
+    # Sikke/ata için basit marj kuralı (istersen ayarlardan değiştirirsin)
+    coin_buy_margin  = float(get_setting("coin_buy_sub",  "50"))   # Harem satıştan şu kadar aşağı al
+    coin_sell_margin = float(get_setting("coin_sell_add", "50"))   # Harem satıştan şu kadar yukarı sat
     if ttype == "Alış":
-        return buy_base + buy_add
+        return base_sell - coin_buy_margin
     else:
-        return sell_base + sell_add
+        return base_sell + coin_sell_margin
 
-def fmt_tl(x: Optional[float]) -> str:
-    if x is None or pd.isna(x):
-        return "-"
-    return f"{x:,.0f} ₺".replace(",", ".")
+# ---------- envanter & kasa ----------
+def compute_inventory() -> pd.DataFrame:
+    tx = read_sql("SELECT * FROM transactions")
+    if tx.empty:
+        return pd.DataFrame(columns=["product","unit","qty","has_grams"])
+    def row_has(r):
+        meta = PRODUCTS.get(r["product"], {"std_weight":0,"purity":1,"unit":"adet"})
+        grams = r["qty_or_gram"] if meta["unit"]=="gram" else r["qty_or_gram"]*meta["std_weight"]
+        grams *= meta["purity"]
+        return grams if r["ttype"]=="Alış" else -grams
+    def row_qty(r):
+        return r["qty_or_gram"] if PRODUCTS.get(r["product"],{}).get("unit")=="gram" else (r["qty_or_gram"] if r["ttype"]=="Alış" else -r["qty_or_gram"])
+    tx["q_delta"]  = tx.apply(row_qty, axis=1)
+    tx["h_delta"]  = tx.apply(row_has, axis=1)
+    inv = tx.groupby("product", as_index=False).agg(qty=("q_delta","sum"), has_grams=("h_delta","sum"))
+    inv["unit"] = inv["product"].map(lambda p: PRODUCTS[p]["unit"] if p in PRODUCTS else "")
+    return inv
 
-# ==================== UI ====================
-st.set_page_config(page_title="Sarıkaya Kuyumculuk – Entegrasyon", layout="wide")
-st.title("💎 Sarıkaya Kuyumculuk – Entegrasyon")
+def compute_cash() -> float:
+    tx = read_sql("SELECT * FROM transactions")
+    if tx.empty:
+        return 0.0
+    # satış -> +, alış -> -
+    tx["delta"] = tx.apply(lambda r: r["total_tl"] if r["ttype"]=="Satış" else -r["total_tl"], axis=1)
+    return float(tx["delta"].sum())
 
-# ---- Sol Panel: Marj Ayarları
-with st.sidebar:
-    st.header("⚙️ Marj Ayarları")
-    st.caption("Öneri hesaplarında kullanılacak TL marjlar.")
-    mdf = get_margins()
-    if not mdf.empty:
-        for _, r in mdf.iterrows():
-            c1, c2, c3 = st.columns([2,1,1])
-            with c1:
-                st.write(f"**{r['product']}**")
-            with c2:
-                nb = st.number_input(f"Alış marjı ({r['product']})", value=float(r["buy_add"]), step=5.0, key=f"b_{r['product']}")
-            with c3:
-                ns = st.number_input(f"Satış marjı ({r['product']})", value=float(r["sell_add"]), step=5.0, key=f"s_{r['product']}")
-            if st.button(f"Kaydet ({r['product']})"):
-                save_margin(r["product"], st.session_state[f"b_{r['product']}"], st.session_state[f"s_{r['product']}"])
-                st.success("Kaydedildi.")
+def ozbag_balance_has() -> float:
+    df = read_sql("SELECT * FROM ozbag_ledger")
+    if df.empty:
+        return 0.0
+    return float(df["has_grams"].sum())
 
-tabs = st.tabs([
-    "Harem Fiyatları (Müşteri Bazı)",
-    "İşlem (Alış/Satış)",
-    "Özbağ Fiyatları (Has Referansı)",
-    "Envanter Raporu",
-])
+# ---------- UI ----------
+st.set_page_config(page_title="Sarıkaya Kuyumculuk – Entegrasyon", page_icon="💎", layout="wide")
 
-# ==================== TAB 1: Harem ====================
+tabs = st.tabs(["Harem Fiyatları (Müşteri Bazı)", "İşlem (Alış/Satış)", "Özbağ Fiyatları (Has Referansı)", "Kasa / Envanter"])
+
+# ============== TAB 1: HAREM ==============
 with tabs[0]:
-    st.subheader("Harem Fiyatları (Müşteri Bazı)")
-    st.caption("CSV biçimi: **Ad,Alış,Satış**  | Örnekler: `Eski Çeyrek,9516,9644` • `Gram Altın,5836.65,5924.87`")
-    h_txt = st.text_area("CSV'yi buraya yapıştırın", height=140, key="harem_csv")
-
-    if st.button("Harem İçeri Al"):
+    st.header("Harem Fiyatları (Müşteri Bazı)")
+    st.caption("CSV biçimi: Ad,Alış,Satış  | Örnek satırlar aşağıda.")
+    default_harem = """Eski Çeyrek,9516,9644
+Eski Yarım,19100,19300
+Eski Tam,38200,38600
+Eski Ata,38400,38800
+Gram Altın,5836.65,5924.87"""
+    h_txt = st.text_area("CSV'yi buraya yapıştırın", value=default_harem, height=140, key="harem_csv")
+    colh1, colh2 = st.columns([1,1])
+    if colh1.button("Harem İçeri Al", use_container_width=True):
         try:
-            df = pd.read_csv(io.StringIO(h_txt), header=None, names=["name","buy","sell"])
-            df["source"] = "HAREM"
-            df["ts"] = dt.datetime.utcnow()
-            write_df("prices", df[["source","name","buy","sell","ts"]])
+            import_harem_csv(h_txt.strip())
             st.success("Harem fiyatları kaydedildi.")
         except Exception as e:
             st.error(f"Hata: {e}")
 
-    st.markdown("#### Son Harem Fiyatları")
-    h_last = read_df("""
-        SELECT source, name, buy, sell, ts
-        FROM (
-            SELECT *,
-                   ROW_NUMBER() OVER (PARTITION BY source, name ORDER BY ts DESC) AS rn
-            FROM prices WHERE source='HAREM'
-        ) t WHERE rn=1
-        ORDER BY name
-    """)
-    st.dataframe(h_last, use_container_width=True)
+    # son kayıtlar
+    last_harem = read_sql("SELECT * FROM prices WHERE source='HAREM' ORDER BY ts DESC LIMIT 200")
+    st.data_editor(last_harem, use_container_width=True, height=320, disabled=True)
 
-# ==================== TAB 2: İşlem (Alış/Satış) ====================
+# ============== TAB 2: İŞLEM ==============
 with tabs[1]:
-    st.subheader("İşlem (Alış/Satış)")
-    st.caption("Öneri fiyatı Harem'deki son kayda göre **10 sn** aralıkla otomatik güncellenir.")
-    st.experimental_data_editor  # keeps mypy calm (noop)
+    st.header("İşlem (Alış/Satış)")
+    st.caption("Öneri fiyatı Harem’deki son kayda göre **10 sn** aralıkla otomatik güncellenir.")
 
-    # Otomatik yenile (10 sn)
-    st.experimental_rerun  # (guard against type-hints)
-    st_autorefresh = st.experimental_data_editor  # placeholder keepers
+    # auto-refresh
+    st_autorefresh = st.experimental_rerun  # sadece isim kısaltma
+    st.experimental_set_query_params(_=dt.datetime.utcnow().timestamp())  # URL cache kırılsın
+    st.empty()  # focus bug fix
 
-    st_autorefresh = st.experimental_rerun  # silence linters
-    st_autorefresh = st.autorefresh(interval=10_000, key="auto_r")
+    product = st.selectbox("Ürün", list(PRODUCTS.keys()))
+    ttype   = st.radio("Tür", ["Satış","Alış"], horizontal=True, index=1 if "Alış" else 0)
+    unit    = PRODUCTS[product]["unit"]
 
-    colA, colB = st.columns([2,1])
-    with colA:
-        product = st.selectbox("Ürün", list(PRODUCTS.keys()))
-    with colB:
-        ttype = st.radio("Tür", ["Satış", "Alış"], horizontal=True)
-
-    unit = PRODUCTS[product]["unit"]
-    std_weight = PRODUCTS[product]["std_weight"]
-
-    c1, c2 = st.columns(2)
-    with c1:
-        qty = st.number_input("Adet" if unit=="adet" else "Gram", min_value=0.01, value=1.00, step=1.0 if unit=="adet" else 0.1)
-    with c2:
-        note = st.text_input("Not", "")
-
-    # Öneri fiyat
-    sp = suggested_price(product, ttype)
-    st.markdown("---")
-    cL, cM, cR = st.columns([2,2,2])
-    with cL:
-        st.metric("Harem Baz (Satış) – bilgi", fmt_tl(get_price_by_any("HAREM", HAREM_ALIASES.get(product,[product]), "sell")))
-    with cM:
-        st.metric(f"Önerilen {ttype} Fiyat", fmt_tl(sp))
-    with cR:
-        st.caption("Marjlar sol panelden değiştirilebilir.")
-
-    price_in = st.number_input("Birim Fiyat (TL)", value=float(sp or 0), step=10.0, format="%.2f")
-
-    # Uyarılar
-    if sp is not None:
-        if ttype == "Satış" and price_in < sp:
-            st.error("⚠️ Satış fiyatı önerinin ALTINDA. Lütfen kontrol edin.")
-        if ttype == "Alış" and price_in > sp:
-            st.error("⚠️ Alış fiyatı önerinin ÜSTÜNDE. Lütfen kontrol edin.")
-
-    if st.button("Kaydet"):
-        try:
-            df = pd.DataFrame([{
-                "date": dt.date.today(),
-                "product": product,
-                "ttype": ttype,
-                "unit": unit,
-                "qty_or_gram": float(qty),
-                "price_tl": float(price_in),
-                "note": note or "",
-                "created_at": dt.datetime.utcnow(),
-            }])
-            write_df("transactions", df)
-            st.success(f"{product} için {ttype} kaydedildi.")
-        except Exception as e:
-            st.error(f"Hata: {e}")
-
-    st.markdown("#### Son İşlemler")
-    tx = read_df("SELECT date, product, ttype, unit, qty_or_gram, price_tl, created_at FROM transactions ORDER BY created_at DESC LIMIT 50")
-    st.dataframe(tx, use_container_width=True)
-
-# ==================== TAB 3: Özbağ ====================
-with tabs[2]:
-    st.subheader("Özbağ Fiyatları (Toptancı / Has Referansı)")
-    st.caption("CSV biçimi: **Ad,Has**  | Örnek: `Çeyrek,0.3520`  • `24 Ayar Gram,1.0000`")
-    o_txt = st.text_area("CSV'yi buraya yapıştırın", height=140, key="ozbag_csv")
-
-    if st.button("Özbağ İçeri Al"):
-        try:
-            df = pd.read_csv(io.StringIO(o_txt), header=None, names=["name","has"])
-            df["source"] = "OZBAG"
-            df["buy"] = None
-            df["sell"] = None
-            df["ts"] = dt.datetime.utcnow()
-            write_df("prices", df[["source","name","buy","sell","has","ts"]])
-            st.success("Özbağ kayıtları kaydedildi.")
-        except Exception as e:
-            st.error(f"Hata: {e}")
-
-    st.markdown("#### Son Özbağ Fiyatları")
-    o_last = read_df("""
-        SELECT source, name, has, ts
-        FROM (
-            SELECT *,
-                   ROW_NUMBER() OVER (PARTITION BY source, name ORDER BY ts DESC) AS rn
-            FROM prices WHERE source='OZBAG'
-        ) t WHERE rn=1
-        ORDER BY name
-    """)
-    st.dataframe(o_last, use_container_width=True)
-
-# ==================== TAB 4: Envanter ====================
-with tabs[3]:
-    st.subheader("📊 Envanter (Has Bazlı)")
-    tx = read_df("SELECT * FROM transactions ORDER BY created_at DESC")
-    if tx.empty:
-        st.info("Henüz işlem yok. Lütfen **İşlem** sekmesinden alış/satış ekleyin.")
+    if unit == "adet":
+        qty = st.number_input("Adet", min_value=1.0, value=1.0, step=1.0)
+        qty_label = "Adet"
     else:
-        # İşlemleri has (gr) cinsine çevir
-        def calc_has(row):
-            prod = row["product"]
-            unit = row["unit"]
-            qty = row["qty_or_gram"]
-            purity = PRODUCTS[prod]["purity"]
-            if unit == "adet":
-                gram = qty * PRODUCTS[prod]["std_weight"]
-            else:
-                gram = qty
-            return gram * purity
+        qty = st.number_input("Gram", min_value=0.01, value=1.00, step=0.10)
+        qty_label = "Gram"
 
-        tx["has_gr"] = tx.apply(calc_has, axis=1)
-        total_has = tx["has_gr"].sum()
-        st.metric("Toplam Has (gr)", f"{total_has:,.2f}".replace(",", "."))
+    # canlı öneri
+    suggested = suggested_price(product, ttype)
+    st.info(f"Önerilen {ttype} fiyatı: **{suggested:.2f} ₺**" if suggested else "Harem verisi eksik.", icon="💡")
 
-        # Has karşılığı (TL) = toplam_has * Harem'de 24 Ayar Gram satışı
-        gram_sell = get_price_by_any("HAREM", HAREM_ALIASES["24 Ayar Gram"], "sell")
-        if gram_sell:
-            st.metric("Has Karşılığı (TL) – Harem 24 Ayar Satış", fmt_tl(total_has * gram_sell))
+    price_input = st.number_input("Birim Fiyat (₺)", min_value=0.0, value=float(suggested or 0.0), step=1.0, format="%.2f")
+    note = st.text_input("Not")
 
-        st.markdown("#### İşlem Listesi")
-        st.dataframe(
-            tx[["date","product","ttype","unit","qty_or_gram","price_tl","has_gr","created_at"]],
-            use_container_width=True
-        )
+    # güvenlik: öneri altı satış / üstü alış uyarısı
+    warn = ""
+    if suggested is not None:
+        if ttype=="Satış" and price_input < suggested:
+            warn = "⚠️ Satış fiyatı önerinin altında!"
+        if ttype=="Alış"  and price_input > suggested:
+            warn = "⚠️ Alış fiyatı önerinin üstünde!"
+
+    if warn:
+        st.warning(warn)
+
+    total = qty * price_input
+    st.metric(label="Toplam (TL)", value=f"{total:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+
+    if st.button("Kaydet", type="primary"):
+        rec = pd.DataFrame([{
+            "date": dt.datetime.utcnow().isoformat(timespec="seconds"),
+            "product": product,
+            "ttype": ttype,
+            "unit": unit,
+            "qty_or_gram": float(qty),
+            "unit_price": float(price_input),
+            "total_tl": float(total),
+            "note": note
+        }])
+        write_df("transactions", rec)
+        st.success(f"{product} için {ttype} kaydedildi.")
+
+    st.subheader("Son İşlemler")
+    tx = read_sql("SELECT * FROM transactions ORDER BY date DESC LIMIT 200")
+    st.data_editor(tx, use_container_width=True, height=320, disabled=True)
+
+# ============== TAB 3: ÖZBAĞ ==============
+with tabs[2]:
+    st.header("Özbağ Fiyatları (Has Referansı)")
+    st.caption("CSV biçimi: Ad,Has  | Örnek: Çeyrek,0.3520  (24 Ayar Gram için 1.0)")
+    default_oz = """Çeyrek,0.3520
+Yarım,0.7040
+Tam,1.4080
+Ata,1.4160
+24 Ayar Gram,1.0000"""
+    o_txt = st.text_area("CSV'yi buraya yapıştırın", value=default_oz, height=140, key="ozbag_csv")
+    if st.button("Özbağ İçeri Al", use_container_width=True):
+        try:
+            import_ozbag_csv(o_txt.strip())
+            st.success("Özbağ kaydı alındı.")
+        except Exception as e:
+            st.error(f"Hata: {e}")
+
+    st.divider()
+    st.subheader("Özbağ Borç (Has) İşlemleri")
+    col1, col2, col3 = st.columns(3)
+    oz_item = col1.selectbox("Kalem", ["Bilezik 22A", "Sikke", "Has Düşüş (Ödeme)", "Diğer"])
+    oz_has  = col2.number_input("Has (gr)", value=0.0, step=0.10, help="+ borç artar, - borç azalır")
+    oz_tl   = col3.number_input("TL (opsiyonel)", value=0.0, step=10.0)
+    oz_note = st.text_input("Not (örn. işçilik, adet vb.)")
+    if st.button("Özbağ Kaydet"):
+        rec = pd.DataFrame([{
+            "date": dt.datetime.utcnow().isoformat(timespec="seconds"),
+            "item": oz_item,
+            "has_grams": float(oz_has),
+            "tl": float(oz_tl),
+            "note": oz_note
+        }])
+        write_df("ozbag_ledger", rec)
+        st.success("Özbağ hareketi kaydedildi.")
+
+    st.metric("Özbağ’a Has Borç (gr)", f"{ozbag_balance_has():,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+    last_oz = read_sql("SELECT * FROM prices WHERE source='OZBAG' ORDER BY ts DESC LIMIT 200")
+    st.data_editor(last_oz, use_container_width=True, height=240, disabled=True)
+    st.subheader("Özbağ Defteri")
+    oz_ledger = read_sql("SELECT * FROM ozbag_ledger ORDER BY date DESC")
+    st.data_editor(oz_ledger, use_container_width=True, height=300, disabled=True)
+
+# ============== TAB 4: KASA / ENVANTER ==============
+with tabs[3]:
+    st.header("Kasa / Envanter")
+    inv = compute_inventory()
+    cash = compute_cash()
+
+    # istenen kalemleri sırayla göster
+    wanted = ["Çeyrek Altın","Yarım Altın","Tam Altın","Ata Lira",
+              "24 Ayar Gram","22 Ayar Gram","22 Ayar 0,5g","22 Ayar 0,25g"]
+
+    rows = []
+    for name in wanted:
+        row = inv[inv["product"]==name]
+        if row.empty:
+            rows.append({"ürün":name, "miktar":0.0, "birim":PRODUCTS[name]["unit"], "has(gr)":0.0})
+        else:
+            r = row.iloc[0]
+            rows.append({"ürün":name, "miktar":round(r["qty"],3), "birim":PRODUCTS[name]["unit"], "has(gr)":round(r["has_grams"],3)})
+    kasadf = pd.DataFrame(rows)
+    st.data_editor(kasadf, use_container_width=True, disabled=True)
+    st.metric("TL Kasa", f"{cash:,.2f} ₺".replace(",", "X").replace(".", ",").replace("X","."))
+
+    st.subheader("Envanter (Has Bazlı Özet)")
+    st.data_editor(inv, use_container_width=True, disabled=True)

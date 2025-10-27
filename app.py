@@ -333,3 +333,36 @@ with tabs[3]:
 
     st.markdown("### Açılış Stok Kayıtları")
     st.dataframe(read_opening(), use_container_width=True)
+    # --- STOK DÜZELTME ---
+with st.expander("🧾 Stok Düzeltme / Güncelleme"):
+    st.caption("Bu işlem yalnızca envanteri günceller, kasayı etkilemez.")
+
+    inv_df = inventory_summary()
+    if inv_df.empty:
+        st.info("Henüz stok yok.")
+    else:
+        product_list = inv_df["product"].tolist()
+        selected_product = st.selectbox("Ürün Seç", product_list)
+        current_qty = float(inv_df.loc[inv_df["product"] == selected_product, "qty_net"].values[0])
+        st.write(f"**Mevcut stok:** {current_qty:,.2f}")
+        new_qty = st.number_input("Yeni stok miktarı", min_value=0.0, value=current_qty, step=0.1)
+
+        if st.button("Stoku Güncelle"):
+            diff = new_qty - current_qty
+            if diff == 0:
+                st.info("Stok aynı, değişiklik yok.")
+            else:
+                unit = PRODUCTS[selected_product]["unit"]
+                has_diff = to_has_grams(selected_product, abs(diff))
+                ts = dt.datetime.utcnow().isoformat(timespec="seconds")
+                note = f"Stok düzeltme (önce: {current_qty}, sonra: {new_qty})"
+                rows = [{
+                    "ts": ts,
+                    "product": selected_product,
+                    "unit": unit,
+                    "qty": diff,
+                    "qty_grams": has_diff * (1 if diff > 0 else -1),
+                    "note": note
+                }]
+                write_opening_stock(rows)
+                st.success(f"{selected_product} stoku {current_qty} → {new_qty} olarak güncellendi.")

@@ -1,72 +1,82 @@
 import sqlite3
 from contextlib import closing
 from datetime import datetime, date
-from typing import List, Dict, Tuple
+from typing import Dict, Tuple
 
 import pandas as pd
 import streamlit as st
 
-# ============ GENEL AYAR ============
+# ===================== GENEL =====================
 st.set_page_config(page_title="Sarıkaya Kuyumculuk — Kâr/Zarar & Envanter", layout="wide")
-
 DB_PATH = "data.db"
 
 PRODUCTS = [
     ("CEYREK", "Çeyrek Altın", "adet"),
-    ("YARIM", "Yarım Altın", "adet"),
-    ("TAM", "Tam Altın", "adet"),
-    ("ATA", "Ata Lira", "adet"),
-    ("G24", "24 Ayar Gram", "gr"),
-    ("G22", "22 Ayar Gram", "gr"),
-    ("G22_05", "22 Ayar 0,5 gr", "gr"),
-    ("G22_025", "22 Ayar 0,25 gr", "gr"),
+    ("YARIM",  "Yarım Altın",   "adet"),
+    ("TAM",    "Tam Altın",     "adet"),
+    ("ATA",    "Ata Lira",      "adet"),
+    ("G24",    "24 Ayar Gram",  "gr"),
+    ("G22",    "22 Ayar Gram",  "gr"),
+    ("G22_05", "22 Ayar 0,5 gr","gr"),
+    ("G22_025","22 Ayar 0,25 gr","gr"),
 ]
 
-# ============ DB KATMANI ============
+# ===================== DB =====================
 def conn():
     return sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
 
 def ensure_db():
     with closing(conn()) as c, c, closing(c.cursor()) as cur:
+        # ürünler
         cur.execute("""
         CREATE TABLE IF NOT EXISTS products(
-            code TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            unit TEXT NOT NULL
+          code TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          unit TEXT NOT NULL
         )
         """)
+        # açılış stokları
         cur.execute("""
         CREATE TABLE IF NOT EXISTS opening(
-            product_code TEXT PRIMARY KEY,
-            qty REAL NOT NULL DEFAULT 0,
-            unit_cost REAL NOT NULL DEFAULT 0,
-            FOREIGN KEY(product_code) REFERENCES products(code)
+          product_code TEXT PRIMARY KEY,
+          qty REAL NOT NULL DEFAULT 0,
+          unit_cost REAL NOT NULL DEFAULT 0,
+          FOREIGN KEY(product_code) REFERENCES products(code)
         )
         """)
+        # açılış TL (tek satır)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS opening_cash(
+          id INTEGER PRIMARY KEY CHECK(id=1),
+          amount REAL NOT NULL DEFAULT 0
+        )
+        """)
+        cur.execute("INSERT OR IGNORE INTO opening_cash(id, amount) VALUES(1, 0)")
+
+        # işlemler
         cur.execute("""
         CREATE TABLE IF NOT EXISTS transactions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,            -- ISO datetime
-            tdate TEXT NOT NULL,         -- YYYY-MM-DD
-            ttype TEXT NOT NULL,         -- BUY / SELL
-            product_code TEXT NOT NULL,
-            qty REAL NOT NULL,
-            unit_price REAL NOT NULL,    -- TL
-            note TEXT,
-            FOREIGN KEY(product_code) REFERENCES products(code)
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,         -- ISO datetime
+          tdate TEXT NOT NULL,      -- YYYY-MM-DD
+          ttype TEXT NOT NULL,      -- BUY / SELL
+          product_code TEXT NOT NULL,
+          qty REAL NOT NULL,
+          unit_price REAL NOT NULL,
+          note TEXT,
+          FOREIGN KEY(product_code) REFERENCES products(code)
         )
         """)
-        # ürünleri yükle
+        # seed ürünler
         cur.execute("SELECT COUNT(1) FROM products")
         if cur.fetchone()[0] == 0:
             cur.executemany("INSERT INTO products(code,name,unit) VALUES(?,?,?)", PRODUCTS)
-        # opening satırları yoksa ekle
-        cur.execute("SELECT COUNT(1) FROM opening")
-        if cur.fetchone()[0] < len(PRODUCTS):
-            existing = {r[0] for r in cur.execute("SELECT product_code FROM opening").fetchall()}
-            missing = [(p[0], 0.0, 0.0) for p in PRODUCTS if p[0] not in existing]
-            if missing:
-                cur.executemany("INSERT INTO opening(product_code,qty,unit_cost) VALUES(?,?,?)", missing)
+        # opening satırları
+        cur.execute("SELECT product_code FROM opening")
+        existing = {r[0] for r in cur.fetchall()}
+        missing = [(p[0], 0.0, 0.0) for p in PRODUCTS if p[0] not in existing]
+        if missing:
+            cur.executemany("INSERT INTO opening(product_code,qty,unit_cost) VALUES(?,?,?)", missing)
         c.commit()
 
 def df_products() -> pd.DataFrame:
@@ -89,6 +99,16 @@ def save_opening(df: pd.DataFrame):
                 "UPDATE opening SET qty=?, unit_cost=? WHERE product_code=?",
                 (float(r["qty"] or 0), float(r["unit_cost"] or 0), r["code"])
             )
+        c.commit()
+
+def get_opening_cash() -> float:
+    with closing(conn()) as c:
+        row = c.execute("SELECT amount FROM opening_cash WHERE id=1").fetchone()
+        return float(row[0]) if row else 0.0
+
+def save_opening_cash(amount: float):
+    with closing(conn()) as c, c, closing(c.cursor()) as cur:
+        cur.execute("UPDATE opening_cash SET amount=? WHERE id=1", (float(amount),))
         c.commit()
 
 def add_txn(tdate: date, ttype: str, product_code: str, qty: float, unit_price: float, note: str = ""):
@@ -115,12 +135,19 @@ def delete_txn(row_id: int):
         cur.execute("DELETE FROM transactions WHERE id=?", (row_id,))
         c.commit()
 
-# ============ HESAPLAMA ============
+# ===================== HESAPLAMA =====================
 def to_float(x) -> float:
     if x is None: return 0.0
     if isinstance(x, (int, float)): return float(x)
     s = str(x).strip()
-    s = s.replace(".", "").replace(",", ".") if s.count(",") and s.count(".") >= 1 else s.replace(",", ".")
+    # 1.234,56 -> 1234.56 ; 1,234.56 -> 1234.56
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")  # 1.234,56
+        else:
+            s = s.replace(",", "")                    # 1,234.56
+    else:
+        s = s.replace(",", ".")
     try:
         return float(s)
     except:
@@ -138,31 +165,29 @@ def chronological_txns() -> pd.DataFrame:
 def running_avg_pnl() -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Satışta kâr = (satış_birim_fiyat - o andaki ağırlıklı ort. maliyet) * qty
-    Envanter = açılış + alışlar - satışlar; son ort. maliyet de ağırlıklı ortalama
+    Envanter: açılış + alış - satış; ort. maliyet ağırlıklı ortalama.
     """
     prods = df_products().set_index("code")[["name", "unit"]]
     opening = get_opening().set_index("code")[["qty", "unit_cost"]]
 
-    # state: avg_cost & qty per product
+    # state
     state_qty: Dict[str, float] = {code: float(opening.loc[code, "qty"]) if code in opening.index else 0.0
                                    for code in prods.index}
     state_cost: Dict[str, float] = {code: float(opening.loc[code, "unit_cost"]) if code in opening.index else 0.0
                                     for code in prods.index}
 
-    # günlük özet satırları
-    pnl_rows = []  # date, sales, purchases, profit
-    inv_rows = []  # product, qty, avg_cost, value
+    pnl_rows = []   # tarih, alış_tutarı, satış_tutarı, günlük_kâr
+    inv_rows = []   # product, qty, avg_cost, value
 
-    # işlemleri gün gün gez
     tx = chronological_txns()
     if tx.empty:
-        # envanteri sadece açılışla hesapla
+        # sadece açılış envanteri
         for code in prods.index:
             q = state_qty[code]
             ac = state_cost[code]
-            inv_rows.append([code, prods.loc[code, "name"], prods.loc[code, "unit"], q, ac, q * ac])
-        pnl_df = pd.DataFrame(columns=["tarih", "toplam_alış", "toplam_satış", "günlük_kâr"])
-        inv_df = pd.DataFrame(inv_rows, columns=["code", "ürün", "birim", "kalan_miktar", "ort_maliyet", "envanter_değeri"])
+            inv_rows.append([code, prods.loc[code,"name"], prods.loc[code,"unit"], q, ac, q*ac])
+        pnl_df = pd.DataFrame(columns=["tarih","toplam_alış","toplam_satış","günlük_kâr"])
+        inv_df = pd.DataFrame(inv_rows, columns=["code","ürün","birim","kalan_miktar","ort_maliyet","envanter_değeri"])
         return pnl_df, inv_df
 
     current_day = None
@@ -184,11 +209,9 @@ def running_avg_pnl() -> Tuple[pd.DataFrame, pd.DataFrame]:
         price = to_float(r["unit_price"])
 
         if r["ttype"] == "BUY":
-            # yeni ortalama maliyet
             old_q, old_c = state_qty[code], state_cost[code]
             new_q = old_q + qty
             if new_q <= 0:
-                # tüm stok bitmişse maliyeti aynı bırak
                 state_qty[code] = 0.0
             else:
                 new_cost = (old_q * old_c + qty * price) / new_q
@@ -203,7 +226,7 @@ def running_avg_pnl() -> Tuple[pd.DataFrame, pd.DataFrame]:
             day_sales += sale_total
             day_profit += (sale_total - cogs)
 
-    # son gün
+    # son gün ekle
     if current_day is not None:
         pnl_rows.append([current_day, day_purchases, day_sales, day_profit])
 
@@ -211,25 +234,25 @@ def running_avg_pnl() -> Tuple[pd.DataFrame, pd.DataFrame]:
     for code in prods.index:
         q = state_qty[code]
         ac = state_cost[code]
-        inv_rows.append([code, prods.loc[code, "name"], prods.loc[code, "unit"], q, ac, q * ac])
+        inv_rows.append([code, prods.loc[code,"name"], prods.loc[code,"unit"], q, ac, q*ac])
 
-    pnl_df = pd.DataFrame(pnl_rows, columns=["tarih", "toplam_alış", "toplam_satış", "günlük_kâr"])
+    pnl_df = pd.DataFrame(pnl_rows, columns=["tarih","toplam_alış","toplam_satış","günlük_kâr"])
     pnl_df["tarih"] = pd.to_datetime(pnl_df["tarih"]).dt.date
     pnl_df["kümülatif_kâr"] = pnl_df["günlük_kâr"].cumsum()
 
-    inv_df = pd.DataFrame(inv_rows, columns=["code", "ürün", "birim", "kalan_miktar", "ort_maliyet", "envanter_değeri"])
+    inv_df = pd.DataFrame(inv_rows, columns=["code","ürün","birim","kalan_miktar","ort_maliyet","envanter_değeri"])
     inv_df = inv_df.sort_values("ürün")
     return pnl_df, inv_df
 
 def cash_balance(pnl_df: pd.DataFrame) -> float:
-    # kasa = satışlar - alışlar (açılış stokları kasayı etkilemez)
-    return float(pnl_df["toplam_satış"].sum() - pnl_df["toplam_alış"].sum()) if not pnl_df.empty else 0.0
+    opening_cash = get_opening_cash()
+    flow = float(pnl_df["toplam_satış"].sum() - pnl_df["toplam_alış"].sum()) if not pnl_df.empty else 0.0
+    return opening_cash + flow
 
-# ============ UI BİLEŞENLERİ ============
-
+# ===================== UI BÖLÜMLERİ =====================
 def header():
     st.markdown("## 💎 Sarıkaya Kuyumculuk — Kâr/Zarar & Envanter")
-    st.caption("Sade panel: Alış/Satış kayıt, günlük kâr hesap, envanter özeti. (Harem/Özbağ entegrasyonu yok)")
+    st.caption("Sade panel: Alış/Satış kayıt, günlük kâr hesap, envanter özeti. (TL açılış bakiyesi destekli)")
 
 def tab_islem():
     st.markdown("### 🧾 İşlem Girişi (Alış / Satış)")
@@ -252,7 +275,9 @@ def tab_islem():
 
     if submitted:
         code = prods.loc[prods["name"] == product, "code"].iloc[0]
-        add_txn(tdate, "BUY" if ttype == "Alış" else "SELL", code, to_float(qty), to_float(unit_price), note)
+        qtyf = to_float(qty)
+        pricef = to_float(unit_price)
+        add_txn(tdate, "BUY" if ttype == "Alış" else "SELL", code, qtyf, pricef, note)
         st.success("İşlem kaydedildi.")
 
     st.markdown("#### Son İşlemler")
@@ -261,8 +286,8 @@ def tab_islem():
         st.info("Henüz işlem yok.")
     else:
         show = tx.rename(columns={
-            "ts": "zaman", "tdate": "tarih", "ttype": "tür", "product_code": "ürün_kodu",
-            "qty": "miktar", "unit_price": "birim_fiyat", "note": "not"
+            "ts":"zaman","tdate":"tarih","ttype":"tür","product_code":"ürün_kodu",
+            "qty":"miktar","unit_price":"birim_fiyat","note":"not"
         })
         st.dataframe(show, use_container_width=True, height=300)
         col1, col2 = st.columns(2)
@@ -281,9 +306,11 @@ def tab_envanter():
     pnl_df, inv_df = running_avg_pnl()
     kasa = cash_balance(pnl_df)
     col1, col2, col3 = st.columns(3)
-    with col1: st.metric("Kasa (TL)", f"{kasa:,.2f}".replace(",", "."))
-    with col2: st.metric("Toplam Envanter Değeri (TL)", f"{inv_df['envanter_değeri'].sum():,.2f}".replace(",", "."))
-    with col3: 
+    with col1:
+        st.metric("Kasa (TL)", f"{kasa:,.2f}".replace(",", "."))
+    with col2:
+        st.metric("Toplam Envanter Değeri (TL)", f"{inv_df['envanter_değeri'].sum():,.2f}".replace(",", "."))
+    with col3:
         toplam_kar = pnl_df["günlük_kâr"].sum() if not pnl_df.empty else 0.0
         st.metric("Toplam Kâr (Açılıştan bugüne)", f"{toplam_kar:,.2f}".replace(",", "."))
 
@@ -301,18 +328,30 @@ def tab_kar_zarar():
         st.info("Henüz işlem yok.")
         return
     show = pnl_df.rename(columns={
-        "tarih": "Tarih",
-        "toplam_alış": "Toplam Alış",
-        "toplam_satış": "Toplam Satış",
-        "günlük_kâr": "Günlük Kâr",
-        "kümülatif_kâr": "Kümülatif Kâr"
+        "tarih":"Tarih","toplam_alış":"Toplam Alış","toplam_satış":"Toplam Satış",
+        "günlük_kâr":"Günlük Kâr","kümülatif_kâr":"Kümülatif Kâr"
     })
     st.dataframe(show, use_container_width=True, height=340)
 
 def tab_acilis():
-    st.markdown("### 🧰 Açılış Stokları")
-    df = get_opening()[["code", "name", "unit", "qty", "unit_cost"]].rename(
-        columns={"code":"code", "name":"ürün", "unit":"birim", "qty":"qty", "unit_cost":"unit_cost"}
+    st.markdown("### 🧰 Açılış Stokları & TL Açılış Bakiyesi")
+
+    # TL Açılış
+    st.markdown("#### TL Açılış Bakiyesi")
+    current_cash = get_opening_cash()
+    colA, colB = st.columns([2,1])
+    with colA:
+        cash_in = st.text_input("TL Açılış (₺)", value=f"{current_cash:.2f}", key="op_cash")
+    with colB:
+        if st.button("TL Açılışı Kaydet", use_container_width=True):
+            save_opening_cash(to_float(cash_in))
+            st.success("TL açılış bakiyesi güncellendi.")
+
+    st.divider()
+    # Envanter Açılış
+    st.markdown("#### Ürün Açılışları (Miktar & Birim Maliyet)")
+    df = get_opening()[["code","name","unit","qty","unit_cost"]].rename(
+        columns={"code":"code","name":"ürün","unit":"birim","qty":"qty","unit_cost":"unit_cost"}
     )
     st.caption("İpucu: Virgül veya nokta kullanabilirsiniz; sistem otomatik düzeltir.")
     edit = st.data_editor(
@@ -331,17 +370,17 @@ def tab_acilis():
         height=360
     )
     if st.button("Açılış Stoklarını Kaydet", use_container_width=True):
-        # numeric düzelt
         tmp = edit.copy()
         tmp["qty"] = tmp["qty"].map(to_float)
         tmp["unit_cost"] = tmp["unit_cost"].map(to_float)
         save_opening(tmp.rename(columns={"ürün":"name","birim":"unit"}))
         st.success("Açılış stokları güncellendi.")
 
-# ============ ANA ============
+# ===================== ANA =====================
 def main():
     ensure_db()
-    header()
+    st.markdown("## 💎 Sarıkaya Kuyumculuk — Kâr/Zarar & Envanter")
+    st.caption("Sade panel: Alış/Satış kayıt, günlük kâr hesap, envanter özeti. (TL açılış bakiyesi destekli)")
     t1, t2, t3, t4 = st.tabs(["🧾 Alış / Satış", "📦 Envanter & Kasa", "📈 Kâr/Zarar", "🧰 Açılış Stokları"])
     with t1: tab_islem()
     with t2: tab_envanter()

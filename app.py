@@ -4,11 +4,11 @@ import datetime as dt
 
 st.set_page_config(page_title="💎 Sarıkaya Kuyumculuk Entegrasyon", layout="wide")
 
-# ==========================
-# Yardımcı Fonksiyonlar
-# ==========================
+# ========================================
+# 🧠 Yardımcı Fonksiyonlar
+# ========================================
 def temiz_fiyat(deger):
-    """Virgül ve nokta karışıklığını düzeltir."""
+    """Nokta-virgül karışıklığını düzeltip float döner"""
     try:
         deger = deger.replace(" ", "").replace("₺", "")
         if "," in deger and "." in deger:
@@ -49,6 +49,7 @@ def parse_ozbag_csv(csv_text):
     return pd.DataFrame(satırlar)
 
 def fiyat_getir(df, ürün, tür):
+    """Harem tablosundan ürünün alış/satış fiyatını döner"""
     eşleştir = {
         "Çeyrek Altın": "Eski Çeyrek",
         "Yarım Altın": "Eski Yarım",
@@ -62,15 +63,15 @@ def fiyat_getir(df, ürün, tür):
         return None
     return satır.iloc[0]["sell" if tür == "Satış" else "buy"]
 
-# ==========================
-# Sekmeler
-# ==========================
+# ========================================
+# 🧭 Sekmeler
+# ========================================
 tabs = st.tabs(["📊 Harem Fiyatları", "💱 Alış / Satış", "🏦 Özbağ Fiyatları", "🏪 Kasa & Envanter"])
 
-# 📊 Harem Fiyatları
+# 📊 HAREM
 with tabs[0]:
     st.header("📊 Harem Fiyatları")
-    st.caption("CSV formatı: Ad,Alış,Satış")
+    st.caption("CSV formatı: Ad,Alış,Satış  |  Örnek: Eski Çeyrek,9516,9644")
     harem_input = st.text_area("CSV'yi buraya yapıştır", key="harem_input")
     if st.button("Harem İçeri Al", key="btn_harem"):
         df = parse_harem_csv(harem_input)
@@ -79,11 +80,11 @@ with tabs[0]:
     if "harem_df" in st.session_state:
         st.dataframe(st.session_state["harem_df"], use_container_width=True)
 
-# 💱 Alış / Satış
+# 💱 ALIŞ / SATIŞ
 with tabs[1]:
     st.header("💱 Alış / Satış İşlemi")
     if "harem_df" not in st.session_state:
-        st.warning("Önce Harem fiyatlarını girin.")
+        st.warning("⚠️ Önce Harem fiyatlarını girin.")
     else:
         ürün = st.selectbox("Ürün Seç", ["Çeyrek Altın","Yarım Altın","Tam Altın","Ata Lira","24 Ayar Gram"])
         tür = st.radio("İşlem Türü", ["Alış","Satış"], horizontal=True)
@@ -93,17 +94,18 @@ with tabs[1]:
             toplam = fiyat * miktar
             st.metric(label="Önerilen Fiyat", value=f"{fiyat:,.2f} ₺")
             st.success(f"Toplam: {toplam:,.2f} ₺")
-            # Doğru ürün için alış fiyatını bul
-alış_fiyatı = fiyat_getir(st.session_state["harem_df"], ürün, "Alış")
-if tür == "Satış" and alış_fiyatı and fiyat < alış_fiyatı:
-    st.error(f"⚠️ Satış fiyatı ({fiyat:,.2f} ₺), alış fiyatı ({alış_fiyatı:,.2f} ₺) altında olamaz!")
+
+            # 🔒 Satış fiyatı alışın altındaysa uyar
+            alış_fiyatı = fiyat_getir(st.session_state["harem_df"], ürün, "Alış")
+            if tür == "Satış" and alış_fiyatı and fiyat < alış_fiyatı:
+                st.error(f"⚠️ Satış fiyatı ({fiyat:,.2f} ₺), alış fiyatı ({alış_fiyatı:,.2f} ₺) altında olamaz!")
         else:
             st.error("⚠️ Fiyat bulunamadı.")
 
-# 🏦 Özbağ
+# 🏦 ÖZBAĞ
 with tabs[2]:
-    st.header("🏦 Özbağ Fiyatları (Toptancı Has)")
-    st.caption("CSV formatı: Ad,Has")
+    st.header("🏦 Özbağ Fiyatları (Toptancı Has Referansı)")
+    st.caption("CSV biçimi: Ad,Has | Örnek: Çeyrek,0.3520")
     ozbag_input = st.text_area("CSV'yi buraya yapıştır", key="ozbag_input")
     if st.button("Özbağ İçeri Al", key="btn_ozbag"):
         df = parse_ozbag_csv(ozbag_input)
@@ -112,21 +114,27 @@ with tabs[2]:
     if "ozbag_df" in st.session_state:
         st.dataframe(st.session_state["ozbag_df"], use_container_width=True)
 
-# 🏪 Kasa & Envanter
+# 🏪 KASA & ENVANTER
 with tabs[3]:
-    st.header("🏪 Kasa ve Envanter")
-    varsayılan = ["Çeyrek Altın","Yarım Altın","Tam Altın","Ata Lira","24 Ayar Gram","22 Ayar Gram","22 Ayar 0.5g","22 Ayar 0.25g","₺ Nakit"]
+    st.header("🏪 Kasa ve Envanter Durumu")
+    varsayılan = [
+        "Çeyrek Altın","Yarım Altın","Tam Altın","Ata Lira",
+        "24 Ayar Gram","22 Ayar Gram","22 Ayar 0.5g","22 Ayar 0.25g","₺ Nakit"
+    ]
     if "envanter" not in st.session_state:
-        st.session_state["envanter"] = {v:0 for v in varsayılan}
+        st.session_state["envanter"] = {v: 0 for v in varsayılan}
 
     ürün = st.selectbox("Ürün", varsayılan)
     miktar = st.number_input("Miktar", min_value=0.0, value=0.0)
     işlem = st.radio("İşlem", ["Ekle","Çıkar"], horizontal=True)
     if st.button("Güncelle"):
-        if işlem=="Ekle":
-            st.session_state["envanter"][ürün]+=miktar
+        if işlem == "Ekle":
+            st.session_state["envanter"][ürün] += miktar
         else:
-            st.session_state["envanter"][ürün]-=miktar
+            st.session_state["envanter"][ürün] -= miktar
         st.success(f"{ürün} stoğu güncellendi ✅")
 
-    st.dataframe(pd.DataFrame(st.session_state["envanter"].items(),columns=["Ürün","Miktar"]),use_container_width=True)
+    st.dataframe(
+        pd.DataFrame(st.session_state["envanter"].items(), columns=["Ürün","Miktar"]),
+        use_container_width=True
+    )

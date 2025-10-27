@@ -140,7 +140,14 @@ with tabs[0]:
     csv_in = st.text_area("CSV'yi buraya yapıştırın", height=120, key="harem_csv_input")
     if st.button("Harem İçeri Al", type="primary", key="btn_harem_import"):
         try:
-            df = pd.read_csv(io.StringIO(csv_in), header=None, names=["name", "buy", "sell"])
+            df = pd.read_csv(
+    io.StringIO(csv_in),
+    header=None,
+    names=["name", "buy", "sell"],
+    sep=",",          # sütun ayırıcı olarak sadece virgül
+    thousands=None,   # binlik ayırıcıyı yok say
+    decimal="."       # ondalık ayracı nokta olarak al
+)
             df["source"] = "HAREM"
             df["ts"] = dt.datetime.utcnow().isoformat(timespec="seconds")
             # sayılara virgül ihtimali

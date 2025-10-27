@@ -138,7 +138,105 @@ tabs = st.tabs(["📊 Harem Fiyatları", "💱 Alış / Çıkış", "🏦 Kasa &
 with tabs[0]:
     st.caption("CSV biçimi: Ad,Alış,Satış  | Örnek: **Eski Çeyrek,9516,9644**  veya **Gram Altın,5820,5900**")
     csv_in = st.text_area("CSV'yi buraya yapıştırın", height=120, key="harem_csv_input")
-    if st.button("Harem İçeri Al", type="primary", key="btn_harem_import"):
+    if st.button("Harem İçeri Al", # ==== HAREM CSV İÇERİ AL - SAĞLAM PARSER ====
+
+import re
+import io
+import pandas as pd
+import datetime as dt
+import streamlit as st
+from sqlalchemy import text
+
+# 1) Her türlü sayı yazımını sayıya çevirir (5.924,87 / 5,924.87 / 5924,87 / 5924.87)
+def _to_float_any(s: str) -> float:
+    s = s.strip()
+    # sadece rakam, nokta, virgül, boşluk al
+    s = re.sub(r"[^\d.,\-]", "", s)
+
+    # Hem nokta hem virgül varsa: sağdan son ayırıcıyı "ondalık" kabul et, diğerlerini binlik say
+    if "." in s and "," in s:
+        last_dot = s.rfind(".")
+        last_com = s.rfind(",")
+        if last_com > last_dot:
+            # son ayırıcı virgül -> virgül ondalık; tüm noktaları sil
+            s = s.replace(".", "")
+            s = s.replace(",", ".")
+        else:
+            # son ayırıcı nokta -> nokta ondalık; tüm virgülleri sil
+            s = s.replace(",", "")
+    else:
+        # Tek ayırıcı varsa: virgülse ondalık kabul edip noktaya çevir, nokta ise aynen kalsın
+        if "," in s and "." not in s:
+            s = s.replace(".", "")  # güvenlik
+            s = s.replace(",", ".")
+        elif "." in s and "," not in s:
+            # 12.345 -> 12345 (binlik), 12.3 -> ondalık.
+            # Basit sezgi: sondan 3 hane + nokta + başında min 1 hane => binlik olabilir
+            if re.match(r"^\d{1,3}(\.\d{3})+(\.\d+)?$", s):
+                s = s.replace(".", "")
+    try:
+        return float(s)
+    except:
+        return float("nan")
+
+# 2) Beklenen metin formatı (esnek):
+# "Eski Çeyrek,9516.00,9644.00"
+# "Gram Altın, 5.724,20 , 5.825,00"
+# "Eski Tam,380640,385760"  (binliksiz)
+def parse_harem_csv(raw: str) -> pd.DataFrame:
+    rows = []
+    for raw_line in (raw or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        # "ad,buy,sell" bekliyoruz; ad kısmı virgül içermez, buy/sell sayısal
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            # Kullanıcı buy/sell'i tek alana yazdıysa gibi durumlar için esnek davranmayalım; uyarıyı altta vereceğiz
+            raise ValueError(f"Satır hatalı: '{line}'. 'Ad,Alış,Satış' bekleniyor.")
+        name = parts[0]
+        buy  = _to_float_any(parts[1])
+        sell = _to_float_any(parts[2])
+        if pd.isna(buy) or pd.isna(sell):
+            raise ValueError(f"Sayı okunamadı: '{line}'")
+        rows.append((name, buy, sell))
+
+    df = pd.DataFrame(rows, columns=["name", "buy", "sell"])
+    df["source"] = "HAREM"
+    df["ts"] = dt.datetime.utcnow()
+    # sütun sırası
+    df = df[["source", "name", "buy", "sell", "ts"]]
+    return df
+
+# 3) UI: benzersiz key ve sağlam hata yakalama
+st.markdown("#### Harem Fiyatları (CSV yapıştır)")
+st.caption("Biçim: `Ad,Alış,Satış`  Örnek: `Eski Çeyrek,9516.00,9644.00` veya `Gram Altın,5.724,20,5.825,00`")
+
+harem_text = st.text_area("CSV'yi buraya yapıştırın", height=140, key="harem_csv_input_v2")
+
+if st.button("Harem İçeri Al", type="primary", key="btn_harem_import_v2"):
+    try:
+        df = parse_harem_csv(harem_text)
+        # DB’ye yaz (örnek SQLAlchemy engine ile)
+        with engine.begin() as conn:
+            df.to_sql("prices", conn, if_exists="append", index=False)
+        st.success("Harem fiyatları kaydedildi.")
+    except Exception as e:
+        st.error(f"Hata: {e}")
+
+# Son kayıtlar
+try:
+    last_harem = pd.read_sql(text("""
+        SELECT source, name, buy, sell, ts
+        FROM prices
+        WHERE source='HAREM'
+        ORDER BY ts DESC
+        LIMIT 200
+    """), engine)
+    # Gösterimde binlik ayraç:
+    st.dataframe(last_harem.style.format({"buy": "{:,.0f}", "sell": "{:,.0f}"}), use_container_width=True)
+except Exception as e:
+    st.error(f"Kayıtları okuma hatası: {e}")type="primary", key="btn_harem_import"):
         try:
             df = pd.read_csv(
     io.StringIO(csv_in),

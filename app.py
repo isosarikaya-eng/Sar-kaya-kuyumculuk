@@ -1,3 +1,4 @@
+
 # app.py — Sarıkaya Kuyumculuk (Harem bazlı) + Mevcut Stok Girişi
 import streamlit as st
 import pandas as pd

@@ -1,554 +1,459 @@
+# -*- coding: utf-8 -*-
 import sqlite3
 from contextlib import closing
 from datetime import datetime, date
-from typing import Dict, Tuple
+from decimal import Decimal, ROUND_HALF_UP
 
 import pandas as pd
 import streamlit as st
 
-# =============== GENEL ===============
-st.set_page_config(page_title="Sarıkaya Kuyumculuk — Kâr/Zarar • Envanter • Borç/Alacak", layout="wide")
-DB_PATH = "data.db"
+# ---------------------------
+# Yardımcı / Sabitler
+# ---------------------------
+DB_PATH = "sarikaya.db"
+
+TL = "TL"
+HAS = "HAS"
 
 PRODUCTS = [
-    ("CEYREK", "Çeyrek Altın", "adet"),
-    ("YARIM",  "Yarım Altın",   "adet"),
-    ("TAM",    "Tam Altın",     "adet"),
-    ("ATA",    "Ata Lira",      "adet"),
-    ("G24",    "24 Ayar Gram",  "gr"),
-    ("G22",    "22 Ayar Gram",  "gr"),
-    ("G22_05", "22 Ayar 0,5 gr","gr"),
-    ("G22_025","22 Ayar 0,25 gr","gr"),
+    # kod, görünen ad, stok birimi, has_katsayısı
+    ("CEYREK", "Eski Çeyrek Altın", TL, Decimal("0")),   # adet bazlı
+    ("YARIM",  "Eski Yarım Altın",  TL, Decimal("0")),
+    ("TAM",    "Eski Tam Altın",    TL, Decimal("0")),
+    ("ATA",    "Eski Ata Lira",     TL, Decimal("0")),
+    ("G24",    "24 Ayar Gram",      TL, Decimal("1.0000")),   # gram x 1.0000 = has gram
+    ("G22",    "22 Ayar Gram",      TL, Decimal("0.9160")),   # varsayılan 22k
+    ("G22_05", "22 Ayar 0,5 gr",    TL, Decimal("0.9160")),
+    ("G22_025","22 Ayar 0,25 gr",   TL, Decimal("0.9160")),
+    ("SCR22",  "22 Ayar Hurda Bilezik", TL, Decimal("0.9140")), # hurda girişinde milYem değişebilir
 ]
 
-# =============== DB ===============
-def conn():
-    return sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
+MARGINS = {
+    # sadece “öneri” göstermek istersen — fiyat girerken referans olur, zorlama yok
+    "CEYREK": {"alis": -50,  "satis": +50},
+    "YARIM":  {"alis": -100, "satis": +100},
+    "TAM":    {"alis": -200, "satis": +200},
+    "ATA":    {"alis": -200, "satis": +200},
+}
 
-def ensure_db():
-    with closing(conn()) as c, c, closing(c.cursor()) as cur:
-        # ürünler
+def tl(x):
+    if x is None: return ""
+    return f"{Decimal(x).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,}".replace(",", "X").replace(".", ",").replace("X",".")
+
+def dec(x) -> Decimal:
+    if isinstance(x, Decimal): return x
+    if x is None or x == "": return Decimal("0")
+    return Decimal(str(x))
+
+def now_ts():
+    return datetime.now().isoformat(timespec="seconds")
+
+# ---------------------------
+# DB Kurulum
+# ---------------------------
+def init_db():
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        cur = con.cursor()
+        # ürün kartı
         cur.execute("""
         CREATE TABLE IF NOT EXISTS products(
-          code TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          unit TEXT NOT NULL
-        )""")
-        # açılış stokları
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            unit TEXT NOT NULL,
+            has_factor TEXT NOT NULL
+        )
+        """)
+        # açılış stok
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS opening(
-          product_code TEXT PRIMARY KEY,
-          qty REAL NOT NULL DEFAULT 0,
-          unit_cost REAL NOT NULL DEFAULT 0,
-          FOREIGN KEY(product_code) REFERENCES products(code)
-        )""")
-        # açılış TL (tek satır)
+        CREATE TABLE IF NOT EXISTS opening_stock(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_code TEXT NOT NULL,
+            qty REAL NOT NULL DEFAULT 0,
+            amount_tl REAL NOT NULL DEFAULT 0,
+            note TEXT,
+            ts TEXT NOT NULL
+        )
+        """)
+        # kasa açılışı
         cur.execute("""
         CREATE TABLE IF NOT EXISTS opening_cash(
-          id INTEGER PRIMARY KEY CHECK(id=1),
-          amount REAL NOT NULL DEFAULT 0
-        )""")
-        cur.execute("INSERT OR IGNORE INTO opening_cash(id, amount) VALUES(1, 0)")
-
-        # alış/satış işlemleri
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            amount_tl REAL NOT NULL DEFAULT 0,
+            note TEXT,
+            ts TEXT NOT NULL
+        )
+        """)
+        # işlemler: alış, satış, hurda_giris, iade, fiyat değişimi vs
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS transactions(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts TEXT NOT NULL,
-          tdate TEXT NOT NULL,
-          ttype TEXT NOT NULL,        -- BUY / SELL
-          product_code TEXT NOT NULL,
-          qty REAL NOT NULL,
-          unit_price REAL NOT NULL,
-          note TEXT,
-          FOREIGN KEY(product_code) REFERENCES products(code)
-        )""")
-
-        # NAKİT: tahsilat/ödeme
+        CREATE TABLE IF NOT EXISTS trx(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tdate TEXT NOT NULL,           -- YYYY-MM-DD
+            ttype TEXT NOT NULL,           -- ALIS / SATIS / HURDA_IN / SUPPLY_OUT / SUPPLY_IN / CASH_IN / CASH_OUT
+            product_code TEXT,             -- nakit işlemlerde boş kalabilir
+            qty REAL DEFAULT 0,            -- adet/gram
+            unit_price_tl REAL DEFAULT 0,  -- birim TL (isteğe bağlı)
+            amount_tl REAL DEFAULT 0,      -- toplam TL (negatif olabilir)
+            note TEXT,
+            counterparty TEXT,             -- müşteri/tedarikçi adı (ÖZBAĞ gibi)
+            has_gram REAL DEFAULT 0,       -- hurda / tedarik işlemlerinde HAS gram
+            milem REAL,                    -- hurda girişinde kullanılan milyem (ör. 0.9140)
+            ts TEXT NOT NULL
+        )
+        """)
+        # tedarikçi ekstre (özbağ)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS cash_moves(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts TEXT NOT NULL,
-          tdate TEXT NOT NULL,
-          mtype TEXT NOT NULL,        -- TAHSILAT / ODEME
-          person TEXT,
-          amount REAL NOT NULL,
-          note TEXT
-        )""")
-
-        # GRAM BAZLI: borç/alacak (kişi-ürün-gram)
+        CREATE TABLE IF NOT EXISTS supplier_ledger(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sname TEXT NOT NULL,          -- tedarikçi adı (ÖZBAĞ)
+            ldate TEXT NOT NULL,          -- YYYY-MM-DD
+            direction TEXT NOT NULL,      -- BORC / ALACAK  (tedarikçi açısından) 
+            currency TEXT NOT NULL,       -- TL / HAS
+            amount REAL NOT NULL DEFAULT 0,
+            note TEXT,
+            ts TEXT NOT NULL
+        )
+        """)
+        # borç-tahsil takip (müşteriler için)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS liabilities(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts TEXT NOT NULL,
-          tdate TEXT NOT NULL,
-          side TEXT NOT NULL,         -- ALACAK (bize borçlu) / BORC (biz borçluyuz)
-          person TEXT NOT NULL,
-          product_code TEXT NOT NULL,
-          grams REAL NOT NULL,
-          note TEXT,
-          FOREIGN KEY(product_code) REFERENCES products(code)
-        )""")
+        CREATE TABLE IF NOT EXISTS receivables(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cname TEXT NOT NULL,          -- isim soyisim
+            rdate TEXT NOT NULL,
+            direction TEXT NOT NULL,      -- BORC / ALACAK  (müşteri açısından)
+            currency TEXT NOT NULL,       -- TL / HAS
+            amount REAL NOT NULL DEFAULT 0,
+            note TEXT,
+            ts TEXT NOT NULL
+        )
+        """)
+        con.commit()
 
-        # seed ürünler & opening
-        cur.execute("SELECT COUNT(1) FROM products")
+        # ürün tablosunu besle
+        cur.execute("SELECT COUNT(*) FROM products")
         if cur.fetchone()[0] == 0:
-            cur.executemany("INSERT INTO products(code,name,unit) VALUES(?,?,?)", PRODUCTS)
+            for code, name, unit, factor in PRODUCTS:
+                cur.execute("INSERT INTO products(code,name,unit,has_factor) VALUES (?,?,?,?)",
+                            (code, name, unit, str(factor)))
+            con.commit()
 
-        cur.execute("SELECT product_code FROM opening")
-        existing = {r[0] for r in cur.fetchall()}
-        missing = [(p[0], 0.0, 0.0) for p in PRODUCTS if p[0] not in existing]
-        if missing:
-            cur.executemany("INSERT INTO opening(product_code,qty,unit_cost) VALUES(?,?,?)", missing)
-        c.commit()
+init_db()
 
-def df_products() -> pd.DataFrame:
-    with closing(conn()) as c:
-        return pd.read_sql_query("SELECT code,name,unit FROM products ORDER BY rowid", c)
+# ---------------------------
+# Veri Fonksiyonları
+# ---------------------------
+def df(sql, params=()):
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        return pd.read_sql_query(sql, con, params=params)
 
-def get_opening() -> pd.DataFrame:
-    with closing(conn()) as c:
-        q = """
-        SELECT p.code, p.name, p.unit, o.qty, o.unit_cost
-        FROM opening o JOIN products p ON p.code=o.product_code
-        ORDER BY p.rowid"""
-        return pd.read_sql_query(q, c)
+def execute(sql, params=()):
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.execute(sql, params)
+        con.commit()
 
-def save_opening(df: pd.DataFrame):
-    with closing(conn()) as c, c, closing(c.cursor()) as cur:
-        for _, r in df.iterrows():
-            cur.execute(
-                "UPDATE opening SET qty=?, unit_cost=? WHERE product_code=?",
-                (float(r["qty"] or 0), float(r["unit_cost"] or 0), r["code"])
-            )
-        c.commit()
+def product_df():
+    d = df("SELECT code,name,unit,has_factor FROM products")
+    d["has_factor"] = d["has_factor"].astype(float)
+    return d
 
-def get_opening_cash() -> float:
-    with closing(conn()) as c:
-        row = c.execute("SELECT amount FROM opening_cash WHERE id=1").fetchone()
-        return float(row[0]) if row else 0.0
+def stock_snapshot():
+    """Açılış + işlemlerden anlık stok."""
+    p = product_df().set_index("code")
+    p["qty"] = 0.0
+    p["cost_tl"] = 0.0
 
-def save_opening_cash(amount: float):
-    with closing(conn()) as c, c, closing(c.cursor()) as cur:
-        cur.execute("UPDATE opening_cash SET amount=? WHERE id=1", (float(amount),))
-        c.commit()
+    op = df("SELECT product_code, qty, amount_tl FROM opening_stock")
+    for _, r in op.iterrows():
+        p.at[r.product_code, "qty"] += float(r.qty)
+        p.at[r.product_code, "cost_tl"] += float(r.amount_tl)
 
-# alış/satış
-def add_txn(tdate: date, ttype: str, product_code: str, qty: float, unit_price: float, note: str = ""):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with closing(conn()) as c, c, closing(c.cursor()) as cur:
-        cur.execute("""INSERT INTO transactions(ts,tdate,ttype,product_code,qty,unit_price,note)
-                       VALUES(?,?,?,?,?,?,?)""",
-                    (ts, tdate.isoformat(), ttype, product_code, qty, unit_price, note))
-        c.commit()
+    # ALIS stok ekler, SATIS düşer, HURDA_IN hurda stok ekler (SCR22)
+    trx = df("SELECT ttype, product_code, qty, amount_tl FROM trx WHERE product_code IS NOT NULL")
+    for _, r in trx.iterrows():
+        code = r.product_code
+        if code not in p.index: 
+            continue
+        q = float(r.qty or 0)
+        amt = float(r.amount_tl or 0)
+        if r.ttype == "ALIS" or r.ttype == "HURDA_IN" or r.ttype == "SUPPLY_IN":
+            p.at[code, "qty"] += q
+            p.at[code, "cost_tl"] += max(0.0, amt)  # maliyet eklenebilir
+        elif r.ttype == "SATIS" or r.ttype == "SUPPLY_OUT":
+            p.at[code, "qty"] -= q
+            p.at[code, "cost_tl"] -= 0.0
 
-def get_txns(limit: int = 500) -> pd.DataFrame:
-    with closing(conn()) as c:
-        q = """SELECT id, ts, tdate, ttype, product_code, qty, unit_price, note
-               FROM transactions
-               ORDER BY ts DESC, id DESC
-               LIMIT ?"""
-        return pd.read_sql_query(q, c, params=(limit,))
+    p["avg_cost_tl"] = p.apply(lambda r: (r.cost_tl / r.qty) if r.qty else 0.0, axis=1)
+    p = p.reset_index().rename(columns={"index":"code"})
+    return p[["code","name","qty","avg_cost_tl","cost_tl"]]
 
-def delete_txn(row_id: int):
-    with closing(conn()) as c, c, closing(c.cursor()) as cur:
-        cur.execute("DELETE FROM transactions WHERE id=?", (row_id,))
-        c.commit()
+def cash_balance_tl():
+    op = df("SELECT COALESCE(SUM(amount_tl),0) v FROM opening_cash").iloc[0]["v"]
+    trx_in = df("SELECT COALESCE(SUM(amount_tl),0) v FROM trx WHERE ttype IN ('SATIS','CASH_IN')").iloc[0]["v"]
+    trx_out= df("SELECT COALESCE(SUM(amount_tl),0) v FROM trx WHERE ttype IN ('ALIS','HURDA_IN','SUPPLY_IN','CASH_OUT')").iloc[0]["v"]
+    return Decimal(op) + Decimal(trx_in) - Decimal(trx_out)
 
-# nakit hareket (tahsilat/ödeme)
-def add_cash_move(tdate: date, mtype: str, person: str, amount: float, note: str = ""):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with closing(conn()) as c, c, closing(c.cursor()) as cur:
-        cur.execute("""INSERT INTO cash_moves(ts,tdate,mtype,person,amount,note)
-                       VALUES(?,?,?,?,?,?)""",
-                    (ts, tdate.isoformat(), mtype, person.strip(), amount, note))
-        c.commit()
-
-def get_cash_moves(limit: int = 300) -> pd.DataFrame:
-    with closing(conn()) as c:
-        q = """SELECT id, ts, tdate, mtype, person, amount, note
-               FROM cash_moves
-               ORDER BY ts DESC, id DESC
-               LIMIT ?"""
-        return pd.read_sql_query(q, c, params=(limit,))
-
-def delete_cash_move(row_id: int):
-    with closing(conn()) as c, c, closing(c.cursor()) as cur:
-        cur.execute("DELETE FROM cash_moves WHERE id=?", (row_id,))
-        c.commit()
-
-# gram bazlı borç/alacak
-def add_liability(tdate: date, side: str, person: str, product_code: str, grams: float, note: str=""):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with closing(conn()) as c, c, closing(c.cursor()) as cur:
-        cur.execute("""INSERT INTO liabilities(ts,tdate,side,person,product_code,grams,note)
-                       VALUES(?,?,?,?,?,?,?)""",
-                    (ts, tdate.isoformat(), side, person.strip(), product_code, grams, note))
-        c.commit()
-
-def get_liabilities(limit: int = 500) -> pd.DataFrame:
-    with closing(conn()) as c:
-        q = """SELECT id, ts, tdate, side, person, product_code, grams, note
-               FROM liabilities
-               ORDER BY ts DESC, id DESC
-               LIMIT ?"""
-        return pd.read_sql_query(q, c, params=(limit,))
-
-def delete_liability(row_id: int):
-    with closing(conn()) as c, c, closing(c.cursor()) as cur:
-        cur.execute("DELETE FROM liabilities WHERE id=?", (row_id,))
-        c.commit()
-
-# =============== HESAPLAMA ===============
-def to_float(x) -> float:
-    if x is None: return 0.0
-    if isinstance(x, (int, float)): return float(x)
-    s = str(x).strip()
-    if "," in s and "." in s:
-        if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "").replace(",", ".")
+def supplier_balance(sname="ÖZBAĞ"):
+    q = df("""
+        SELECT currency, direction, COALESCE(SUM(amount),0) amt
+        FROM supplier_ledger WHERE sname=?
+        GROUP BY currency, direction
+    """, (sname,))
+    tl_borc = tl_alacak = Decimal("0")
+    has_borc = has_alacak = Decimal("0")
+    for _, r in q.iterrows():
+        amt = Decimal(str(r.amt))
+        if r.currency == TL:
+            if r.direction == "BORC":  tl_borc += amt
+            else:                      tl_alacak += amt
         else:
-            s = s.replace(",", "")
-    else:
-        s = s.replace(",", ".")
-    try:
-        return float(s)
-    except:
-        return 0.0
+            if r.direction == "BORC":  has_borc += amt
+            else:                      has_alacak += amt
+    return {
+        "TL": (tl_borc - tl_alacak),
+        "HAS": (has_borc - has_alacak)
+    }
 
-def chronological_txns() -> pd.DataFrame:
-    with closing(conn()) as c:
-        q = """SELECT ts, tdate, ttype, product_code, qty, unit_price
-               FROM transactions
-               ORDER BY ts ASC, id ASC"""
-        return pd.read_sql_query(q, c)
+def today_profit():
+    # Sadece bugün yapılan SATIS - ALIS (TL) farkı (çok basit k/z)
+    d = date.today().isoformat()
+    s = df("SELECT COALESCE(SUM(amount_tl),0) v FROM trx WHERE tdate=? AND ttype='SATIS'", (d,)).iloc[0]["v"]
+    a = df("SELECT COALESCE(SUM(amount_tl),0) v FROM trx WHERE tdate=? AND ttype='ALIS'", (d,)).iloc[0]["v"]
+    return Decimal(s) - Decimal(a)
 
-def running_avg_pnl() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    prods = df_products().set_index("code")[["name", "unit"]]
-    opening = get_opening().set_index("code")[["qty", "unit_cost"]]
+# ---------------------------
+# UI
+# ---------------------------
+st.set_page_config(page_title="Sarıkaya Kuyumculuk", page_icon="💎", layout="centered")
 
-    state_qty: Dict[str, float] = {code: float(opening.loc[code, "qty"]) if code in opening.index else 0.0
-                                   for code in prods.index}
-    state_cost: Dict[str, float] = {code: float(opening.loc[code, "unit_cost"]) if code in opening.index else 0.0
-                                    for code in prods.index}
+st.title("💎 Sarıkaya Kuyumculuk")
+st.caption("Günlük kâr/zarar – Envanter – 22 Ayar Hurda – Özbağ Bakiye")
 
-    pnl_rows, inv_rows = [], []
-    tx = chronological_txns()
-    if tx.empty:
-        for code in prods.index:
-            q = state_qty[code]; ac = state_cost[code]
-            inv_rows.append([code, prods.loc[code,"name"], prods.loc[code,"unit"], q, ac, q*ac])
-        pnl_df = pd.DataFrame(columns=["tarih","toplam_alış","toplam_satış","günlük_kâr"])
-        inv_df = pd.DataFrame(inv_rows, columns=["code","ürün","birim","kalan_miktar","ort_maliyet","envanter_değeri"])
-        return pnl_df, inv_df
+tabs = st.tabs([
+    "Açılış / Ayarlar",
+    "Alış – Satış",
+    "22 Ayar Hurda Girişi",
+    "Tedarikçi (Özbağ) İşlemleri",
+    "Kasa & Envanter",
+    "Borç / Tahsilat (Müşteri)"
+])
 
-    current_day = None
-    day_purchases = day_sales = day_profit = 0.0
+# ---------------------------
+# 1) Açılış / Ayarlar
+# ---------------------------
+with tabs[0]:
+    st.subheader("Açılış Stokları")
+    p = product_df()
+    p_options = {f"{r['name']} ({r['code']})": r["code"] for _, r in p.iterrows()}
+    c1, c2 = st.columns(2)
+    with c1:
+        sel = st.selectbox("Ürün", list(p_options.keys()))
+        qty = st.number_input("Miktar (adet/gr)", min_value=0.0, step=1.0)
+    with c2:
+        amt = st.number_input("Toplam Maliyet (₺)", min_value=0.0, step=100.0)
+        note = st.text_input("Not", "")
+    if st.button("Açılış Stok Ekle"):
+        execute("INSERT INTO opening_stock(product_code,qty,amount_tl,note,ts) VALUES (?,?,?,?,?)",
+                (p_options[sel], qty, amt, note, now_ts()))
+        st.success("Eklendi.")
 
-    for _, r in tx.iterrows():
-        d = r["tdate"]
-        if current_day is None:
-            current_day = d
-        if d != current_day:
-            pnl_rows.append([current_day, day_purchases, day_sales, day_profit])
-            current_day = d
-            day_purchases = day_sales = day_profit = 0.0
+    st.divider()
+    st.subheader("Açılış Kasası (₺)")
+    cash_amt = st.number_input("Kasa Açılış Tutarı (₺)", min_value=0.0, step=100.0)
+    if st.button("Kasa Açılışı Kaydet"):
+        execute("INSERT INTO opening_cash(amount_tl, note, ts) VALUES (?,?,?)", (cash_amt, "Açılış", now_ts()))
+        st.success("Kaydedildi.")
 
-        code = r["product_code"]
-        qty = to_float(r["qty"])
-        price = to_float(r["unit_price"])
+    st.divider()
+    st.subheader("Ürün Kartları")
+    st.dataframe(p, hide_index=True, use_container_width=True)
 
-        if r["ttype"] == "BUY":
-            old_q, old_c = state_qty[code], state_cost[code]
-            new_q = old_q + qty
-            if new_q <= 0:
-                state_qty[code] = 0.0
-            else:
-                new_cost = (old_q * old_c + qty * price) / new_q
-                state_cost[code] = new_cost
-                state_qty[code] = new_q
-            day_purchases += qty * price
-        else:  # SELL
-            ac = state_cost[code]
-            state_qty[code] = max(0.0, state_qty[code] - qty)
-            sale_total = qty * price
-            cogs = qty * ac
-            day_sales += sale_total
-            day_profit += (sale_total - cogs)
+# ---------------------------
+# 2) Alış – Satış
+# ---------------------------
+with tabs[1]:
+    st.subheader("Alış / Satış İşlemi")
+    p = product_df()
+    p_options = {f"{r['name']} ({r['code']})": r for _, r in p.iterrows()}
+    choice = st.selectbox("Ürün Seç", list(p_options.keys()))
+    prod = p_options[choice]
+    ttype = st.radio("İşlem Türü", ["SATIS","ALIS"], index=0, horizontal=True)
 
-    if current_day is not None:
-        pnl_rows.append([current_day, day_purchases, day_sales, day_profit])
+    cols = st.columns(3)
+    with cols[0]:
+        qty = st.number_input("Adet / Gram", min_value=0.0, step=1.0, value=1.0)
+    with cols[1]:
+        unit_price = st.number_input("Birim Fiyat (₺)", min_value=0.0, step=10.0)
+    with cols[2]:
+        cust = st.text_input("Müşteri / Not", "")
 
-    for code in prods.index:
-        q = state_qty[code]; ac = state_cost[code]
-        inv_rows.append([code, prods.loc[code,"name"], prods.loc[code,"unit"], q, ac, q*ac])
+    # Öneri sadece çeyrek/yarım/tam/ata için marj tablosundan
+    if prod["code"] in MARGINS:
+        st.caption("İpucu: Eski ziynet için marj rehberi; TL fiyatını siz girersiniz.")
+        st.info(f"Alış marjı: {MARGINS[prod['code']]['alis']} ₺ | Satış marjı: +{MARGINS[prod['code']]['satis']} ₺")
 
-    pnl_df = pd.DataFrame(pnl_rows, columns=["tarih","toplam_alış","toplam_satış","günlük_kâr"])
-    pnl_df["tarih"] = pd.to_datetime(pnl_df["tarih"]).dt.date
-    pnl_df["kümülatif_kâr"] = pnl_df["günlük_kâr"].cumsum()
+    total = Decimal(unit_price) * Decimal(qty)
+    st.metric("Toplam", f"{tl(total)} ₺")
 
-    inv_df = pd.DataFrame(inv_rows, columns=["code","ürün","birim","kalan_miktar","ort_maliyet","envanter_değeri"])
-    inv_df = inv_df.sort_values("ürün")
-    return pnl_df, inv_df
-
-def cash_balance(pnl_df: pd.DataFrame) -> float:
-    opening_cash = get_opening_cash()
-    flow_tx = float(pnl_df["toplam_satış"].sum() - pnl_df["toplam_alış"].sum()) if not pnl_df.empty else 0.0
-    # tahsilat/ödeme
-    with closing(conn()) as c:
-        cm = pd.read_sql_query("""SELECT mtype, amount FROM cash_moves""", c)
-    if cm.empty:
-        flow_cm = 0.0
-    else:
-        cm["signed"] = cm["amount"] * cm["mtype"].map({"TAHSILAT": +1, "ODEME": -1})
-        flow_cm = float(cm["signed"].sum())
-    return opening_cash + flow_tx + flow_cm
-
-def liabilities_summary() -> pd.DataFrame:
-    """Kişi x ürün bazında net gram (ALACAK +, BORC -)."""
-    with closing(conn()) as c:
-        li = pd.read_sql_query("""SELECT side, person, product_code, grams FROM liabilities""", c)
-        prods = df_products().set_index("code")["name"].to_dict()
-    if li.empty:
-        return pd.DataFrame(columns=["Kişi","Ürün","Net Gram"])
-    li["signed"] = li.apply(lambda r: r["grams"] * (+1 if r["side"]=="ALACAK" else -1), axis=1)
-    li["Ürün"] = li["product_code"].map(prods)
-    out = li.groupby(["person","Ürün"], as_index=False)["signed"].sum()
-    out = out.rename(columns={"person":"Kişi","signed":"Net Gram"}).sort_values(["Kişi","Ürün"])
-    return out
-
-def person_card(person: str) -> pd.DataFrame:
-    """Seçili kişi için son kayıtlar ve net gram özetini döndürür."""
-    with closing(conn()) as c:
-        li = pd.read_sql_query("""SELECT tdate, side, product_code, grams, note
-                                  FROM liabilities WHERE person=? ORDER BY tdate DESC, rowid DESC""", c, params=(person,))
-        cm = pd.read_sql_query("""SELECT tdate, mtype, amount, note
-                                  FROM cash_moves WHERE person=? ORDER BY tdate DESC, rowid DESC""", c, params=(person,))
-        prods = df_products().set_index("code")["name"].to_dict()
-    if not li.empty:
-        li["Ürün"] = li["product_code"].map(prods)
-        li["Gram (±)"] = li.apply(lambda r: r["grams"]*(+1 if r["side"]=="ALACAK" else -1), axis=1)
-    return li, cm
-
-# =============== UI ===============
-def header():
-    st.markdown("## 💎 Sarıkaya Kuyumculuk — Kâr/Zarar • Envanter • Borç/Alacak")
-    st.caption("Alış/Satış, envanter, kasa (TL açılış + satış−alış + tahsilat−ödeme) ve kişi bazlı gram borç/alacak")
-
-def tab_txn():
-    st.markdown("### 🧾 İşlem Girişi (Alış / Satış)")
-    prods = df_products()
-    colA, colB, colC, colD = st.columns([2,1,1,2])
-    with st.form("txn_form", clear_on_submit=False):
-        with colA:
-            product = st.selectbox("Ürün", prods["name"].tolist(), index=4, key="txn_prod")
-        with colB:
-            ttype = st.radio("Tür", ["Satış", "Alış"], horizontal=True, key="txn_type")
-        with colC:
-            qty = st.number_input("Miktar", min_value=0.00, step=1.00, value=1.00, format="%.2f", key="txn_qty")
-        with colD:
-            unit_price = st.text_input("Birim Fiyat (₺)", value="0", key="txn_price")
-        tdate = st.date_input("Tarih", value=date.today(), key="txn_date")
-        note = st.text_input("Not (opsiyonel)", key="txn_note")
-        submitted = st.form_submit_button("Kaydet", use_container_width=True)
-    if submitted:
-        code = prods.loc[prods["name"] == product, "code"].iloc[0]
-        add_txn(tdate, "BUY" if ttype=="Alış" else "SELL", code, to_float(qty), to_float(unit_price), note)
+    if st.button("Kaydet"):
+        execute("""
+            INSERT INTO trx(tdate, ttype, product_code, qty, unit_price_tl, amount_tl, note, counterparty, ts)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (date.today().isoformat(), ttype, prod["code"], qty, unit_price, float(total), cust, cust, now_ts()))
         st.success("İşlem kaydedildi.")
 
-    st.markdown("#### Son İşlemler")
-    tx = get_txns(200)
-    if tx.empty:
-        st.info("Henüz işlem yok.")
-    else:
-        show = tx.rename(columns={
-            "ts":"zaman","tdate":"tarih","ttype":"tür","product_code":"ürün_kodu",
-            "qty":"miktar","unit_price":"birim_fiyat","note":"not"
-        })
-        st.dataframe(show, use_container_width=True, height=300)
-        col1, col2 = st.columns(2)
-        with col1:
-            rid = st.number_input("Silinecek işlem id", min_value=0, step=1, value=0, format="%d")
-        with col2:
-            if st.button("İşlemi Sil"):
-                if rid > 0:
-                    delete_txn(int(rid)); st.success("Silindi. Yenileyin.")
-                else:
-                    st.warning("Geçerli bir ID girin.")
+# ---------------------------
+# 3) 22 Ayar Hurda Girişi
+# ---------------------------
+with tabs[2]:
+    st.subheader("22 Ayar Hurda Bilezik Girişi (HAS hesaplı)")
+    st.caption("Hurda bilezik aldığında gram x milyem = HAS gram kaydı yapılır. Milyem aksi belirtilmezse 0.9140 kabul edilir.")
 
-def tab_envanter():
-    st.markdown("### 📦 Envanter & Kasa Özeti")
-    pnl_df, inv_df = running_avg_pnl()
-    kasa = cash_balance(pnl_df)
-    col1, col2, col3 = st.columns(3)
-    with col1: st.metric("Kasa (TL)", f"{kasa:,.2f}".replace(",", "."))
-    with col2: st.metric("Toplam Envanter Değeri (TL)", f"{inv_df['envanter_değeri'].sum():,.2f}".replace(",", "."))
-    with col3:
-        toplam_kar = pnl_df["günlük_kâr"].sum() if not pnl_df.empty else 0.0
-        st.metric("Toplam Kâr (Açılıştan bugüne)", f"{toplam_kar:,.2f}".replace(",", "."))
-    st.markdown("#### Envanter Detayı (ağırlıklı ort. maliyet)")
-    inv_show = inv_df.rename(columns={
-        "ürün":"Ürün","birim":"Birim","kalan_miktar":"Kalan",
-        "ort_maliyet":"Ort. Maliyet","envanter_değeri":"Değer (TL)"
-    })[["Ürün","Birim","Kalan","Ort. Maliyet","Değer (TL)"]]
-    st.dataframe(inv_show, use_container_width=True, height=340)
+    hurda_qty = st.number_input("Hurda Net Gram", min_value=0.0, step=0.1)
+    milem = st.number_input("Milyem (örn 0.9140)", min_value=0.8000, max_value=0.9500, value=0.9140, step=0.0001, format="%.4f")
+    unit_price = st.number_input("Birim Fiyat (₺/gr)", min_value=0.0, step=10.0)
+    total = Decimal(hurda_qty) * Decimal(unit_price)
+    has_gram = Decimal(hurda_qty) * Decimal(str(milem))
+    note = st.text_input("Not / Müşteri", "")
 
-def tab_pnl():
-    st.markdown("### 📈 Günlük Kâr / Zarar")
-    pnl_df, _ = running_avg_pnl()
-    if pnl_df.empty:
-        st.info("Henüz işlem yok.")
-        return
-    show = pnl_df.rename(columns={
-        "tarih":"Tarih","toplam_alış":"Toplam Alış",
-        "toplam_satış":"Toplam Satış","günlük_kâr":"Günlük Kâr",
-        "kümülatif_kâr":"Kümülatif Kâr"
-    })
-    st.dataframe(show, use_container_width=True, height=340)
+    c1, c2 = st.columns(2)
+    with c1: st.metric("TOPLAM (₺)", tl(total))
+    with c2: st.metric("HAS Gram", f"{has_gram:.2f}")
 
-def tab_opening():
-    st.markdown("### 🧰 Açılış Stokları & TL Açılış")
-    # TL Açılış
-    st.markdown("#### TL Açılış Bakiyesi")
-    current_cash = get_opening_cash()
-    colA, colB = st.columns([2,1])
-    with colA:
-        cash_in = st.text_input("TL Açılış (₺)", value=f"{current_cash:.2f}", key="op_cash")
-    with colB:
-        if st.button("TL Açılışı Kaydet", use_container_width=True):
-            save_opening_cash(to_float(cash_in)); st.success("Güncellendi.")
+    if st.button("Hurda Girişini Kaydet"):
+        # stok SCR22 ürününe miktar girişi; TL çıkışı kasa açısından ALIŞ sayılır
+        execute("""
+            INSERT INTO trx(tdate, ttype, product_code, qty, unit_price_tl, amount_tl, note, has_gram, milem, ts)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, (date.today().isoformat(), "HURDA_IN", "SCR22", float(hurda_qty), float(unit_price), float(total), note, float(has_gram), float(milem), now_ts()))
+        st.success("Hurda giriş kaydı alındı.")
+
     st.divider()
-    # Ürün Açılış
-    st.markdown("#### Ürün Açılışları (Miktar & Birim Maliyet)")
-    df = get_opening()[["code","name","unit","qty","unit_cost"]].rename(
-        columns={"code":"code","name":"ürün","unit":"birim","qty":"qty","unit_cost":"unit_cost"})
-    st.caption("Virgül veya nokta kullanabilirsiniz; otomatik düzeltilir.")
-    edit = st.data_editor(
-        df, use_container_width=True, num_rows="fixed", hide_index=True,
-        column_config={
-            "code": st.column_config.TextColumn("Kod", disabled=True),
-            "ürün": st.column_config.TextColumn("Ürün", disabled=True),
-            "birim": st.column_config.TextColumn("Birim", disabled=True),
-            "qty": st.column_config.NumberColumn("Miktar", step=0.01, format="%.3f"),
-            "unit_cost": st.column_config.NumberColumn("Birim Maliyet (TL)", step=0.01, format="%.2f"),
-        }, key="opening_editor", height=360
-    )
-    if st.button("Açılış Stoklarını Kaydet", use_container_width=True):
-        tmp = edit.copy()
-        tmp["qty"] = tmp["qty"].map(to_float); tmp["unit_cost"] = tmp["unit_cost"].map(to_float)
-        save_opening(tmp.rename(columns={"ürün":"name","birim":"unit"}))
-        st.success("Açılış stokları güncellendi.")
+    st.subheader("Hurda Stok ve Son Kayıtlar")
+    snap = stock_snapshot()
+    st.dataframe(snap[snap["code"]=="SCR22"], hide_index=True, use_container_width=True)
+    last = df("SELECT tdate,qty,unit_price_tl,amount_tl,has_gram,milem,note FROM trx WHERE ttype='HURDA_IN' ORDER BY id DESC LIMIT 50")
+    st.dataframe(last, hide_index=True, use_container_width=True)
 
-def tab_cash_and_liabilities():
-    st.markdown("### 🤝 Tahsilat / Ödeme (TL) & Borç/Alacak (Gram)")
+# ---------------------------
+# 4) Tedarikçi (Özbağ) İşlemleri
+# ---------------------------
+with tabs[3]:
+    st.subheader("Özbağ Tedarikçi İşlemleri")
+    st.caption("Hurda HAS’ı Özbağ’a gönderip karşılığında ürün aldığında veya TL ödeme yaptığında burada kaydet.")
 
-    prods = df_products()
-    col1, col2 = st.columns(2)
+    sname = "ÖZBAĞ"
+    mode = st.radio("İşlem", ["Hurda Gönder (HAS) → Özbağ BORÇ", "Özbağ’dan Ürün Al (Stoka Gir) → Özbağ ALACAK",
+                               "Özbağ’a TL Ödeme → Özbağ ALACAK", "Özbağ’dan TL Tahsil → Özbağ BORÇ"], horizontal=False)
 
-    # ---- NAKİT: Tahsilat/Ödeme ----
-    with col1:
-        st.subheader("💵 Tahsilat / Ödeme (Kasa)")
-        with st.form("cash_form", clear_on_submit=False):
-            mtype = st.radio("Tür", ["Tahsilat (Kasa +)", "Ödeme (Kasa -)"], horizontal=False, key="cm_type")
-            person = st.text_input("İsim Soyisim (opsiyonel)", key="cm_person")
-            amount = st.text_input("Tutar (₺)", value="0", key="cm_amount")
-            mdate  = st.date_input("Tarih", value=date.today(), key="cm_date")
-            note   = st.text_input("Not", key="cm_note")
-            ok = st.form_submit_button("Kaydet", use_container_width=True)
-        if ok:
-            kind = "TAHSILAT" if "Tahsilat" in mtype else "ODEME"
-            val = to_float(amount)
-            if val <= 0:
-                st.error("Tutar 0’dan büyük olmalı.")
-            else:
-                add_cash_move(mdate, kind, person, val, note)
-                st.success("Kayıt eklendi.")
+    if "Hurda" in mode:
+        has_amt = st.number_input("Gönderilen HAS (gr)", min_value=0.0, step=0.1)
+        note = st.text_input("Not", "")
+        if st.button("Kaydet (HAS Gönder)"):
+            # tedarikçiye BORÇ (onların bize hakkı doğar) – HAS para birimi
+            execute("""
+                INSERT INTO supplier_ledger(sname, ldate, direction, currency, amount, note, ts)
+                VALUES (?,?,?,?,?,?,?)
+            """, (sname, date.today().isoformat(), "BORC", HAS, float(has_amt), note, now_ts()))
+            # aynı anda hurda stoktan düş (tedarikçiye gönderildiği için)
+            execute("""
+                INSERT INTO trx(tdate, ttype, product_code, qty, unit_price_tl, amount_tl, note, has_gram, ts)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (date.today().isoformat(), "SUPPLY_OUT", "SCR22", float(has_amt/Decimal("0.9140")), 0.0, 0.0, f"Özbağ’a {has_amt} HAS gönderildi", float(has_amt), now_ts()))
+            st.success("Kaydedildi.")
 
-        st.markdown("#### Son Nakit Hareketleri")
-        cm = get_cash_moves(200)
-        if cm.empty:
-            st.info("Kayıt yok.")
-        else:
-            st.dataframe(cm.rename(columns={"tdate":"tarih","mtype":"tür","person":"kişi","amount":"tutar"}), use_container_width=True, height=260)
-            rid = st.number_input("Silinecek nakit kayıt id", min_value=0, step=1, value=0, format="%d")
-            if st.button("Nakit Kaydı Sil"):
-                if rid>0: delete_cash_move(int(rid)); st.success("Silindi. Yenileyin.")
-                else: st.warning("Geçerli ID girin.")
+    elif "Ürün Al" in mode:
+        prod_map = {f"{r['name']} ({r['code']})": r for _, r in product_df().iterrows() if r["code"]!="SCR22"}
+        sel = st.selectbox("Ürün", list(prod_map.keys()))
+        item = prod_map[sel]
+        qty = st.number_input("Miktar (adet/gram)", min_value=0.0, step=1.0)
+        unit_price = st.number_input("Birim Fiyat (₺)", min_value=0.0, step=10.0)
+        note = st.text_input("Not", "")
+        total = Decimal(qty) * Decimal(unit_price)
+        st.metric("Toplam", f"{tl(total)} ₺")
 
-    # ---- GRAM: Borç/Alacak ----
-    with col2:
-        st.subheader("⚖️ Borç / Alacak (Gram Bazlı)")
-        with st.form("li_form", clear_on_submit=False):
-            side = st.radio("Taraf", ["Alacak (Bize borçlu)", "Borç (Biz borçluyuz)"], horizontal=False, key="li_side")
-            person = st.text_input("İsim Soyisim", key="li_person")
-            product = st.selectbox("Ürün", prods["name"].tolist(), index=4, key="li_prod")
-            grams = st.text_input("Gram/Adet", value="1", key="li_grams")
-            ldate = st.date_input("Tarih", value=date.today(), key="li_date")
-            note  = st.text_input("Not", key="li_note")
-            ok2 = st.form_submit_button("Kaydet", use_container_width=True)
-        if ok2:
-            gval = to_float(grams)
-            if not person.strip():
-                st.error("İsim Soyisim zorunlu.")
-            elif gval <= 0:
-                st.error("Gram/Adet 0’dan büyük olmalı.")
-            else:
-                code = prods.loc[prods["name"]==product, "code"].iloc[0]
-                tag = "ALACAK" if side.startswith("Alacak") else "BORC"
-                add_liability(ldate, tag, person.strip(), code, gval, note)
-                st.success("Kayıt eklendi.")
+        if st.button("Kaydet (Ürün Girişi)"):
+            # stok girişi
+            execute("""
+                INSERT INTO trx(tdate, ttype, product_code, qty, unit_price_tl, amount_tl, note, counterparty, ts)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (date.today().isoformat(), "SUPPLY_IN", item["code"], qty, unit_price, float(total), note, sname, now_ts()))
+            # tedarikçiye ALACAK (borcumuz azalır) TL cinsinden
+            execute("""
+                INSERT INTO supplier_ledger(sname, ldate, direction, currency, amount, note, ts)
+                VALUES (?,?,?,?,?,?,?)
+            """, (sname, date.today().isoformat(), "ALACAK", TL, float(total), f"{item['name']} {qty} birim", now_ts()))
+            st.success("Kaydedildi.")
 
-        st.markdown("#### Kişi Bazlı Gram Özeti")
-        li_sum = liabilities_summary()
-        st.dataframe(li_sum, use_container_width=True, height=220)
+    elif "TL Ödeme" in mode:
+        amt = st.number_input("Ödeme Tutarı (₺)", min_value=0.0, step=100.0)
+        note = st.text_input("Not", "")
+        if st.button("Kaydet (Ödeme)"):
+            execute("""
+                INSERT INTO supplier_ledger(sname, ldate, direction, currency, amount, note, ts)
+                VALUES (?,?,?,?,?,?,?)
+            """, (sname, date.today().isoformat(), "ALACAK", TL, float(amt), note, now_ts()))
+            # kasa çıkışı
+            execute("""
+                INSERT INTO trx(tdate, ttype, amount_tl, note, counterparty, ts)
+                VALUES (?,?,?,?,?,?)
+            """, (date.today().isoformat(), "CASH_OUT", float(amt), f"Özbağ ödemesi: {note}", sname, now_ts()))
+            st.success("Kaydedildi.")
 
-        st.markdown("#### Son Borç/Alacak Kayıtları")
-        li = get_liabilities(200)
-        if li.empty:
-            st.info("Kayıt yok.")
-        else:
-            show = li.rename(columns={
-                "tdate":"tarih","side":"taraf","person":"kişi",
-                "product_code":"ürün_kodu","grams":"gram","note":"not"
-            })
-            st.dataframe(show, use_container_width=True, height=220)
-            rid2 = st.number_input("Silinecek borç/alacak id", min_value=0, step=1, value=0, format="%d")
-            if st.button("Borç/Alacak Kaydı Sil"):
-                if rid2>0: delete_liability(int(rid2)); st.success("Silindi. Yenileyin.")
-                else: st.warning("Geçerli ID girin.")
+    else:  # TL Tahsil
+        amt = st.number_input("Tahsilat (₺)", min_value=0.0, step=100.0)
+        note = st.text_input("Not", "")
+        if st.button("Kaydet (Tahsil)"):
+            execute("""
+                INSERT INTO supplier_ledger(sname, ldate, direction, currency, amount, note, ts)
+                VALUES (?,?,?,?,?,?,?)
+            """, (sname, date.today().isoformat(), "BORC", TL, float(amt), note, now_ts()))
+            execute("""
+                INSERT INTO trx(tdate, ttype, amount_tl, note, counterparty, ts)
+                VALUES (?,?,?,?,?,?)
+            """, (date.today().isoformat(), "CASH_IN", float(amt), f"Özbağ tahsilat: {note}", sname, now_ts()))
+            st.success("Kaydedildi.")
 
-    # ---- Kişi kartı (hızlı kontrol) ----
-    st.markdown("### 👤 Kişi Özeti")
-    who = st.text_input("Kişi adı (tam yaz):", key="person_lookup")
-    if who.strip():
-        li, cm = person_card(who.strip())
-        colx, coly = st.columns(2)
-        with colx:
-            st.markdown("**Gram Hareketleri (Borç/Alacak)**")
-            if li.empty: st.info("Kayıt yok.")
-            else: st.dataframe(li[["tdate","side","Ürün","grams","Gram (±)","note"]].rename(
-                columns={"tdate":"tarih","side":"taraf","grams":"gram","note":"not"}), use_container_width=True, height=220)
-        with coly:
-            st.markdown("**TL Hareketleri (Tahsilat/Ödeme)**")
-            if cm.empty: st.info("Kayıt yok.")
-            else: st.dataframe(cm.rename(columns={"tdate":"tarih","mtype":"tür","amount":"tutar","note":"not"}), use_container_width=True, height=220)
+    st.divider()
+    st.subheader("Özbağ Bakiye")
+    bal = supplier_balance()
+    c1, c2 = st.columns(2)
+    with c1: st.metric("Özbağ Bakiye (TL)", tl(bal["TL"]))
+    with c2: st.metric("Özbağ Bakiye (HAS)", f"{Decimal(bal['HAS']).quantize(Decimal('0.01'))} gr")
+    st.dataframe(df("SELECT ldate as tarih, direction as yon, currency as birim, amount as tutar, note as aciklama FROM supplier_ledger ORDER BY id DESC LIMIT 100"),
+                 hide_index=True, use_container_width=True)
 
-# =============== ANA ===============
-def main():
-    ensure_db()
-    header()
-    t1, t2, t3, t4, t5 = st.tabs([
-        "🧾 Alış / Satış",
-        "📦 Envanter & Kasa",
-        "📈 Kâr/Zarar",
-        "🧰 Açılış Stokları",
-        "🤝 Tahsilat/Ödeme & Borç/Alacak"
-    ])
-    with t1: tab_txn()
-    with t2: tab_envanter()
-    with t3: tab_pnl()
-    with t4: tab_opening()
-    with t5: tab_cash_and_liabilities()
+# ---------------------------
+# 5) Kasa & Envanter
+# ---------------------------
+with tabs[4]:
+    st.subheader("Kasa & Envanter Özeti")
+    st.metric("Kasa (₺)", tl(cash_balance_tl()))
+    st.metric("Bugünkü Kâr / Zarar (basit)", tl(today_profit()))
+    st.markdown("### Stok")
+    snap = stock_snapshot()
+    snap["qty"] = snap["qty"].round(2)
+    snap["avg_cost_tl"] = snap["avg_cost_tl"].round(2)
+    snap["cost_tl"] = snap["cost_tl"].round(2)
+    st.dataframe(snap.rename(columns={"code":"Kod","name":"Ürün","qty":"Miktar","avg_cost_tl":"Ort.Maliyet(₺)","cost_tl":"Toplam Maliyet(₺)"}),
+                 hide_index=True, use_container_width=True)
 
-if __name__ == "__main__":
-    main()
+# ---------------------------
+# 6) Borç / Tahsilat (Müşteri)
+# ---------------------------
+with tabs[5]:
+    st.subheader("Müşteri – Borç / Tahsilat")
+    cname = st.text_input("İsim – Soyisim")
+    dirm = st.radio("İşlem", ["BORC","ALACAK"], horizontal=True)
+    curr = st.radio("Para Birimi", [TL, HAS], horizontal=True, index=0)
+    amt = st.number_input("Tutar", min_value=0.0, step=10.0)
+    note = st.text_input("Not", "")
+    if st.button("Kaydet (Müşteri)"):
+        execute("""
+            INSERT INTO receivables(cname, rdate, direction, currency, amount, note, ts)
+            VALUES (?,?,?,?,?,?,?)
+        """, (cname, date.today().isoformat(), dirm, curr, float(amt), note, now_ts()))
+        st.success("Kaydedildi.")
+
+    st.divider()
+    st.subheader("Müşteri Ekstresi")
+    r = df("SELECT rdate as tarih, cname as isim, direction as yon, currency as birim, amount as tutar, note as aciklama FROM receivables ORDER BY id DESC LIMIT 200")
+    st.dataframe(r, hide_index=True, use_container_width=True)

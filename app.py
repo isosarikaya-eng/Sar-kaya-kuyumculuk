@@ -57,9 +57,7 @@ def ozbag():
     return {"source": OZBAG_URL, **data}
     from fastapi.responses import PlainTextResponse
 
-@app.get("/prices.csv", response_class=PlainTextResponse)
-def prices_csv():
-    from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse
 
 @app.get("/prices.csv", response_class=PlainTextResponse)
 def prices_csv():

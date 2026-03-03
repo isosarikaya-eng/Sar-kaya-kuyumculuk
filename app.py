@@ -1,3 +1,5 @@
+from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
 import re
 from fastapi import FastAPI
 from playwright.sync_api import sync_playwright
@@ -57,7 +59,6 @@ def ozbag():
     return {"source": OZBAG_URL, **data}
     from fastapi.responses import PlainTextResponse
 
-from fastapi.responses import PlainTextResponse
 
 @app.get("/prices.csv", response_class=PlainTextResponse)
 def prices_csv():

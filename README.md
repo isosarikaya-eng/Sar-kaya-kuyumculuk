@@ -1,1 +1,0 @@
-# Sar-kaya-kuyumculuk

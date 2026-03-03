@@ -1,154 +1,76 @@
-import os
-import re
 import time
-from typing import Dict, Any, Tuple
+from typing import Any, Dict, Optional, Tuple
 
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 app = FastAPI()
 
-OZBAG_URL = "https://ozbag.com/"
+# --- AYARLAR ---
+OZBAG_API_URL = "https://api.ozbag.com/api/altin"
+CACHE_TTL_SECONDS = 60  # 60 sn cache (Google Sheets çok çağırdığı için iyi olur)
 
-# --- Basit cache (Railway için hayat kurtarır) ---
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "60"))
-_cache: Dict[str, Tuple[float, Any]] = {}  # key -> (ts, data)
-
-
-def _cache_get(key: str):
-    item = _cache.get(key)
-    if not item:
-        return None
-    ts, data = item
-    if time.time() - ts <= CACHE_TTL_SECONDS:
-        return data
-    return None
+# Basit in-memory cache
+_cache: Dict[str, Any] = {
+    "ts": 0.0,
+    "data": None,
+}
 
 
-def _cache_set(key: str, data: Any):
-    _cache[key] = (time.time(), data)
-
-
-def fetch_ozbag_page() -> str:
+def _get_ozbag_data_cached() -> Tuple[Any, bool]:
     """
-    Ozbağ sayfasını Playwright ile açıp HTML'i döner.
-    Railway gibi container ortamında stabil olması için:
-    - headless True
-    - no-sandbox / disable-dev-shm-usage
-    - timeout + küçük wait
+    Ozbağ API verisini cache'li döndürür.
+    Returns: (data, from_cache)
     """
+    now = time.time()
+    ts = float(_cache.get("ts") or 0.0)
+
+    if _cache.get("data") is not None and (now - ts) < CACHE_TTL_SECONDS:
+        return _cache["data"], True
+
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ],
-            )
-            context = browser.new_context(
-                locale="tr-TR",
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                ),
-            )
-            page = context.new_page()
-
-            # 60 sn timeout
-            page.goto(OZBAG_URL, timeout=60000, wait_until="domcontentloaded")
-
-            # Bazı siteler fiyatları JS ile sonradan basıyor: küçük bekleme
-            page.wait_for_timeout(3000)
-
-            html = page.content()
-
-            context.close()
-            browser.close()
-
-            return html
-
-    except PlaywrightTimeoutError:
-        raise HTTPException(status_code=503, detail="Playwright timeout: ozbag.com geç yanıt verdi.")
+        r = requests.get(
+            OZBAG_API_URL,
+            timeout=15,
+            headers={"User-Agent": "ozbag-scraper/1.0"},
+        )
+        r.raise_for_status()
+        data = r.json()
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Playwright error: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=502, detail=f"Ozbağ API okunamadı: {e}")
+
+    _cache["ts"] = now
+    _cache["data"] = data
+    return data, False
 
 
-def _normalize_money(s: str) -> str:
+def _to_float(val: Any) -> Optional[float]:
     """
-    '12.345,67' gibi TR formatını normalize edip '12345.67' haline getirir.
+    '12.345,67' veya '12345.67' gibi değerleri float'a çevirir.
+    Çeviremezse None döner.
     """
-    s = s.strip()
-    s = s.replace("₺", "").replace("TL", "").replace("tl", "").strip()
-    # 12.345,67 -> 12345.67
-    s = s.replace(".", "").replace(",", ".")
-    return s
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
 
+    s = str(val).strip()
+    if not s:
+        return None
 
-def parse_prices_from_html(html: str) -> Dict[str, Any]:
-    """
-    HTML içinden fiyatları yakalamaya çalışır.
-    1) Sayfanın text halini çıkarır (tag'leri atar gibi).
-    2) "Kalem ... fiyat" tarzı eşleştirme dener.
-    3) Olmazsa ham bulunan para değerlerini listeler.
-    """
-    # Çok basit bir "text çıkarma"
-    text = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.IGNORECASE)
-    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    # Türkçe format desteği
+    # Örn: 12.345,67 -> 12345.67
+    s = s.replace("₺", "").replace("TL", "").replace(" ", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s and "." not in s:
+        s = s.replace(",", ".")
 
-    # Para yakalama (TR format + TL/₺ opsiyonel)
-    # Örn: 12.345,67  |  123.456  |  123.456,00  |  12345
-    money_re = re.compile(r"(?:₺\s*)?\b\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?\b(?:\s*(?:TL|tl))?")
-
-    found_money = money_re.findall(text)
-    found_money = [m.strip() for m in found_money]
-    # Duplicates temizle ama sıralamayı bozmayalım
-    seen = set()
-    found_money_unique = []
-    for m in found_money:
-        if m not in seen:
-            seen.add(m)
-            found_money_unique.append(m)
-
-    # Kuyumcu kalemleri (senin sheet’teki gibi)
-    keywords = [
-        "Çeyrek", "Yarım", "Tam", "Gramse", "Ata", "Ata lira",
-        "Gram Altın", "Gram", "22 Ayar", "24 Ayar", "Has",
-    ]
-
-    # Etiket-fiyat eşleştirme:
-    # "Çeyrek ... 12.150" veya "Çeyrek 12150" gibi yakın geçenleri yakalamaya çalışır.
-    result: Dict[str, Any] = {}
-    for kw in keywords:
-        # kw’den sonra 0-40 karakter içinde bir para değeri ara
-        pattern = re.compile(rf"({re.escape(kw)})\s{{0,40}}({money_re.pattern})", re.IGNORECASE)
-        m = pattern.search(text)
-        if m:
-            label = m.group(1).strip()
-            money = m.group(2).strip()
-            result[label] = money
-
-    return {
-        "source": OZBAG_URL,
-        "items": result,                 # eşleştirebildiklerimiz
-        "raw_found": found_money_unique, # sayfada gördüğümüz ham fiyatlar
-        "cache_ttl_seconds": CACHE_TTL_SECONDS,
-    }
-
-
-def get_prices() -> Dict[str, Any]:
-    cached = _cache_get("ozbag_prices")
-    if cached:
-        return cached
-
-    html = fetch_ozbag_page()
-    data = parse_prices_from_html(html)
-    _cache_set("ozbag_prices", data)
-    return data
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 
 @app.get("/")
@@ -158,29 +80,60 @@ def health():
 
 @app.get("/ozbag")
 def ozbag():
-    return get_prices()
+    """
+    Ozbağ API verisini JSON olarak döndürür.
+    """
+    data, from_cache = _get_ozbag_data_cached()
+    return {"source": OZBAG_API_URL, "from_cache": from_cache, "data": data}
 
 
 @app.get("/prices.csv", response_class=PlainTextResponse)
 def prices_csv():
     """
-    Google Sheets: =IMPORTDATA("https://.../prices.csv")
-    CSV format: kalem,fiyat
+    Google Sheets için CSV çıktısı üretir:
+    kalem,fiyat
+    Çeyrek,12150
+    Yarım,24300
     """
-    data = get_prices()
-    items: Dict[str, str] = data.get("items", {})
+    data, _ = _get_ozbag_data_cached()
+
+    if not isinstance(data, list):
+        raise HTTPException(status_code=502, detail="Beklenmeyen Ozbağ veri formatı (list değil).")
 
     lines = ["kalem,fiyat"]
 
-    # Eğer eşleştirme boşsa, en azından ham bulunanları dökelim
-    if not items:
-        raw = data.get("raw_found", [])[:30]
-        for i, m in enumerate(raw, start=1):
-            lines.append(f"bulunan_{i},{m}")
-        return "\n".join(lines)
+    # Ozbağ API'nin alan adları değişebilir diye esnek okuyoruz.
+    # Öncelik: satis -> satış fiyatı
+    for item in data:
+        if not isinstance(item, dict):
+            continue
 
-    # Eşleşenleri yaz
-    for k, v in items.items():
-        lines.append(f"{k},{v}")
+        name = item.get("name") or item.get("kalem") or item.get("urun") or item.get("title") or "Bilinmeyen"
+        price_raw = (
+            item.get("satis")
+            or item.get("satış")
+            or item.get("sell")
+            or item.get("price")
+            or item.get("fiyat")
+        )
+
+        price = _to_float(price_raw)
+
+        # Eğer fiyat parse edilemezse boş geçiyoruz (istersen kaldırabiliriz)
+        if price is None:
+            continue
+
+        # CSV virgül ayracı olduğu için isimde virgül varsa tırnaklayalım
+        name_str = str(name)
+        if "," in name_str or '"' in name_str:
+            name_str = '"' + name_str.replace('"', '""') + '"'
+
+        # Float'ı sade yaz (12150.0 -> 12150)
+        if price.is_integer():
+            price_str = str(int(price))
+        else:
+            price_str = str(price)
+
+        lines.append(f"{name_str},{price_str}")
 
     return "\n".join(lines)

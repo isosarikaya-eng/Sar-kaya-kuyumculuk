@@ -1,46 +1,57 @@
-import streamlit as st
+import re
+from fastapi import FastAPI
+from playwright.sync_api import sync_playwright
 
-st.set_page_config(
-    page_title="Sarrafiye TV",
-    page_icon="💎",
-    layout="wide"
-)
+app = FastAPI()
 
-st.title("💎 Sarrafiye TV")
-st.markdown("---")
+OZBAG_URL = "https://ozbag.com/"
 
-st.subheader("📊 Günlük HAS Kuru")
+def parse_prices_from_html(html: str) -> dict:
+    """
+    Burada sayfadaki görünen metinden fiyatları çekiyoruz.
+    Özbağ sayfasında etiket isimleri değişebilir.
+    İlk çalıştırmada ham text'i görüp regex'i netleştiririz.
+    """
+    # Basit örnek: ₺12.345,67 veya 12345,67 gibi
+    money = r"(?:₺\s*)?\d{1,3}(?:\.\d{3})*(?:,\d{2})"
+    found = re.findall(money, html)
+    return {
+        "raw_found": found[:50],  # debug için ilk 50
+    }
 
-if "has_kuru" not in st.session_state:
-    st.session_state.has_kuru = 0.0
+def fetch_ozbag_page() -> str:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            locale="tr-TR",
+            viewport={"width": 1280, "height": 720},
+        )
+        page = context.new_page()
+        page.goto(OZBAG_URL, wait_until="domcontentloaded", timeout=60000)
 
-col1, col2 = st.columns(2)
+        # JS ile yüklenen içerik için biraz bekle:
+        page.wait_for_timeout(4000)
 
-with col1:
-    has_input = st.number_input(
-        "HAS Kuru (₺)",
-        min_value=0.0,
-        step=0.1,
-        value=st.session_state.has_kuru
-    )
+        # Eğer sayfa üzerinde belli bir fiyat alanı varsa buraya selector koyarız:
+        # page.wait_for_selector("text=Çeyrek", timeout=15000)
 
-    if st.button("Kaydet"):
-        st.session_state.has_kuru = has_input
-        st.success("HAS kuru kaydedildi.")
+        html = page.content()
+        browser.close()
+        return html
 
-with col2:
-    st.metric(
-        label="Aktif HAS Kuru",
-        value=f"{st.session_state.has_kuru:.2f} ₺"
-    )
+@app.get("/")
+def health():
+    return {"ok": True, "service": "ozbag-scraper"}
 
-st.markdown("---")
-st.subheader("🔄 TL → HAS Dönüştürme")
-
-tl_amount = st.number_input("TL Tutarı", min_value=0.0, step=100.0)
-
-if st.session_state.has_kuru > 0:
-    has_value = tl_amount / st.session_state.has_kuru
-    st.success(f"Karşılığı: {has_value:.4f} HAS")
-else:
-    st.warning("Önce HAS kuru giriniz.")
+@app.get("/ozbag")
+def ozbag():
+    html = fetch_ozbag_page()
+    data = parse_prices_from_html(html)
+    return {"source": OZBAG_URL, **data}

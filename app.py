@@ -59,13 +59,15 @@ def ozbag():
 
 @app.get("/prices.csv", response_class=PlainTextResponse)
 def prices_csv():
-    # Burada senin mevcut scrape/parse fonksiyonunu çağıracağız.
-    # Örnek: result = get_prices() -> dict gibi
-    result = get_prices()  # <-- senin fonksiyon adın neyse onu yaz
+    from fastapi.responses import PlainTextResponse
 
-    # CSV formatı: başlık satırı + satırlar
-    # Örnek dict: {"gram_altin": 1234.5, "ceyrek": 5678.0, ...}
+@app.get("/prices.csv", response_class=PlainTextResponse)
+def prices_csv():
+    html = fetch_ozbag_page()
+    result = parse_prices_from_html(html)
+
     lines = ["kalem,fiyat"]
+
     for k, v in result.items():
         lines.append(f"{k},{v}")
 

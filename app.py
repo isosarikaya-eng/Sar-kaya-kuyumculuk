@@ -1,697 +1,524 @@
 import os
-import re
 import json
+import re
 import time
+import asyncio
 from typing import Dict, Any, Optional
-
-import requests
-from bs4 import BeautifulSoup
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from playwright.async_api import async_playwright
 
-# ------------------------------------------------------------
-# Config (Railway Variables)
-# ------------------------------------------------------------
-OZBAG_SOURCE_URL = os.getenv("OZBAG_SOURCE_URL", "https://www.ozbag.com/").strip()
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "30").strip())
+
+# =========================
+# ENV / AYARLAR
+# =========================
+OZBAG_SITE_URL = os.getenv("OZBAG_SITE_URL", "https://www.ozbag.com/").strip()
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "30"))
 LOGO_URL = os.getenv("LOGO_URL", "/static/logo.png").strip()
 
-# Margin system (optional)
-# You can set MARGINS_JSON as a JSON string in Railway:
-# {
-#   "ESKI_CEYREK": {"alis_add": 0, "satis_add": 0, "alis_mul": 1.0, "satis_mul": 1.0},
-#   "ONS": {"alis_add": 0, "satis_add": 0, "alis_mul": 1.0, "satis_mul": 1.0}
-# }
-MARGINS_JSON_RAW = os.getenv("MARGINS_JSON", "").strip()
+# Marj eklemek için opsiyonel:
+# Örnek:
+# MARGIN_JSON='{"ESKI_CEYREK":{"buy":0,"sell":50},"ONS_ALTIN":{"buy":0,"sell":0}}'
+MARGIN_JSON_RAW = os.getenv("MARGIN_JSON", "").strip()
+try:
+    MARGIN = json.loads(MARGIN_JSON_RAW) if MARGIN_JSON_RAW else {}
+except Exception:
+    MARGIN = {}
 
-DEFAULT_MARGINS: Dict[str, Dict[str, float]] = {
-    # key: {alis_add, satis_add, alis_mul, satis_mul}
-    "ESKI_CEYREK": {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0},
-    "ESKI_YARIM":  {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0},
-    "ESKI_TAM":    {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0},
-    "ESKI_GRAMSE": {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0},
-    "ESKI_ATA":    {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0},
-    "ONS":         {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0},
-}
-
-def load_margins() -> Dict[str, Dict[str, float]]:
-    margins = dict(DEFAULT_MARGINS)
-    if not MARGINS_JSON_RAW:
-        return margins
-    try:
-        user = json.loads(MARGINS_JSON_RAW)
-        if isinstance(user, dict):
-            for k, v in user.items():
-                if isinstance(v, dict):
-                    margins[k] = {
-                        "alis_add": float(v.get("alis_add", margins.get(k, {}).get("alis_add", 0.0))),
-                        "satis_add": float(v.get("satis_add", margins.get(k, {}).get("satis_add", 0.0))),
-                        "alis_mul": float(v.get("alis_mul", margins.get(k, {}).get("alis_mul", 1.0))),
-                        "satis_mul": float(v.get("satis_mul", margins.get(k, {}).get("satis_mul", 1.0))),
-                    }
-    except Exception:
-        # If margins JSON is broken, ignore and use defaults
-        return dict(DEFAULT_MARGINS)
-    return margins
-
-MARGINS = load_margins()
-
-# ------------------------------------------------------------
-# Product mapping
-# ------------------------------------------------------------
-# We will scrape Ozbag "Sarrafiye" table:
-# Columns usually: Yeni Alış, Yeni Satış, Eski Alış, Eski Satış
-# You asked: Eski Çeyrek/Yarım/Tam/Gramse/Ata (alış+satış) + Ons alış+satış
-#
-# NOTE: "ONS" might be under another section ("Altın Fiyatları") not the Sarrafiye table.
-# This app will try to find it anywhere in tables by label matching.
-PRODUCTS = [
-    # key, display_name, ozbag_row_label, which columns to use
-    ("ESKI_CEYREK", "Eski Çeyrek", "ÇEYREK", "ESKI"),
-    ("ESKI_YARIM",  "Eski Yarım",  "YARIM",  "ESKI"),
-    ("ESKI_TAM",    "Eski Tam",    "TAM",    "ESKI"),
-    ("ESKI_GRAMSE", "Eski Gramse", "GRAMSE", "ESKI"),
-    ("ESKI_ATA",    "Eski Ata",    "ATA",    "ESKI"),
-    ("ONS",         "Ons Altın",   "ONS",    "GENEL"),
+# Hangi ürünleri gösteriyoruz?
+# key: API’de dönen anahtar
+# label: ekranda görünen başlık
+# ozbag_row: tabloda satır ismi (sarrafiye tablosu)
+# type: "sarrafiye_eski" veya "ons"
+ITEMS = [
+    {"key": "ESKI_CEYREK", "label": "Eski Çeyrek", "ozbag_row": "ÇEYREK", "type": "sarrafiye_eski"},
+    {"key": "ESKI_YARIM",  "label": "Eski Yarım",  "ozbag_row": "YARIM",  "type": "sarrafiye_eski"},
+    {"key": "ESKI_TAM",    "label": "Eski Tam",    "ozbag_row": "TAM",    "type": "sarrafiye_eski"},
+    {"key": "ESKI_GREMSE", "label": "Eski Gremse", "ozbag_row": "GREMSE", "type": "sarrafiye_eski"},
+    {"key": "ESKI_ATA",    "label": "Eski Ata",    "ozbag_row": "ATA",    "type": "sarrafiye_eski"},
+    {"key": "ONS_ALTIN",   "label": "Ons Altın",   "ozbag_row": None,     "type": "ons"},
 ]
 
-# ------------------------------------------------------------
-# Simple in-memory cache
-# ------------------------------------------------------------
+
+app = FastAPI(title="Sarıkaya Kuyumculuk TV")
+
+
+# =========================
+# BASİT CACHE
+# =========================
 _cache: Dict[str, Any] = {
-    "ts": 0.0,
-    "data": None,       # last good payload
-    "source": "YEDEK",  # OZBAG / CACHE / YEDEK
-    "error": None
+    "ts": 0,
+    "data": None,
+    "source": "YOK",
+    "error": None,
+    "last_ok_ts": 0,
 }
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-def now_ts() -> float:
-    return time.time()
 
-def normalize_label(s: str) -> str:
-    s = (s or "").strip().upper()
-    # Turkish normalize for common letters
-    s = s.replace("İ", "I").replace("İ", "I")
-    s = s.replace("Ş", "S").replace("Ğ", "G").replace("Ü", "U").replace("Ö", "O").replace("Ç", "C")
-    s = re.sub(r"\s+", " ", s)
-    return s
+def _now() -> int:
+    return int(time.time())
 
-def parse_price(text: str) -> Optional[float]:
-    if not text:
+
+def _to_float(s: str) -> Optional[float]:
+    if s is None:
         return None
-    t = text.strip()
-    # Keep digits, dot, comma
-    t = re.sub(r"[^\d\.,-]", "", t)
-    if not t:
+    s = str(s).strip()
+    if not s:
         return None
-    # Turkish style: 12.150 or 12,150
-    # If both exist, assume dot is thousand and comma is decimal (rare here)
-    if "," in t and "." in t:
-        # remove thousand separator dot
-        t = t.replace(".", "")
-        # use dot for decimal
-        t = t.replace(",", ".")
-    else:
-        # if comma only, treat as thousand or decimal -> most prices are integers, so remove commas
-        if "," in t and "." not in t:
-            t = t.replace(",", "")
-        # if dot only, treat as thousand separator -> remove dot
-        if "." in t and "," not in t:
-            # could be decimal, but in TR price tables it's almost always thousand separator
-            t = t.replace(".", "")
+    # 7.436.287 gibi (binlik .) veya 7,436.287 gibi karışık gelebilir
+    # TR format: 12,150 -> 12150
+    s = s.replace("₺", "").replace("$", "").replace("€", "").strip()
+    s = s.replace(".", "").replace(",", ".")  # 12.150 -> 12150, 7,436 -> 7.436
     try:
-        return float(t)
+        return float(s)
     except Exception:
         return None
 
-def apply_margin(key: str, alis: Optional[float], satis: Optional[float]) -> Dict[str, Optional[float]]:
-    m = MARGINS.get(key, {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0})
-    if alis is not None:
-        alis = alis * float(m.get("alis_mul", 1.0)) + float(m.get("alis_add", 0.0))
-    if satis is not None:
-        satis = satis * float(m.get("satis_mul", 1.0)) + float(m.get("satis_add", 0.0))
-    return {"alis": alis, "satis": satis}
 
-def fetch_html_requests(url: str, timeout: int = 20) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (TV-Price-App; +https://railway.app/)",
-        "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.7",
-    }
-    r = requests.get(url, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    return r.text
+def _apply_margin(item_key: str, buy: Optional[float], sell: Optional[float]) -> (Optional[float], Optional[float]):
+    m = MARGIN.get(item_key, {}) if isinstance(MARGIN, dict) else {}
+    mb = _to_float(m.get("buy")) if isinstance(m, dict) else None
+    ms = _to_float(m.get("sell")) if isinstance(m, dict) else None
+    if buy is not None and mb is not None:
+        buy = buy + mb
+    if sell is not None and ms is not None:
+        sell = sell + ms
+    return buy, sell
 
-def extract_tables(html: str) -> Dict[str, Dict[str, Dict[str, float]]]:
+
+# =========================
+# OZBAG SCRAPE (PLAYWRIGHT)
+# =========================
+async def fetch_ozbag_prices() -> Dict[str, Any]:
     """
-    Return mapping:
-    {
-      "CEYREK": {"yeni_alis": x, "yeni_satis": y, "eski_alis": a, "eski_satis": b},
-      ...
-      "ONS": {"alis": x, "satis": y}  (if found in any table as 2-price row)
-    }
+    ozbag.com ana sayfayı gerçek tarayıcıyla açar,
+    Sarrafiye tablosundan (Eski Alış/Eski Satış) çeker,
+    ayrıca Altın/Ons panelinden ons alış/satış çeker.
     """
-    soup = BeautifulSoup(html, "lxml")
-    tables = soup.find_all("table")
-    rows_map: Dict[str, Dict[str, Dict[str, float]]] = {}
+    ua = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    )
 
-    for table in tables:
-        # read headers
-        headers = []
-        thead = table.find("thead")
-        if thead:
-            headers = [normalize_label(th.get_text(" ", strip=True)) for th in thead.find_all(["th", "td"])]
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ])
+        context = await browser.new_context(
+            user_agent=ua,
+            locale="tr-TR",
+            timezone_id="Europe/Istanbul",
+            extra_http_headers={
+                "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            }
+        )
+        page = await context.new_page()
+
+        # Biraz daha “insan” davranışı
+        await page.goto(OZBAG_SITE_URL, wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(1200)
+
+        # Sarrafiye tablosu bekle (sayfada var)
+        # Sayfa HTML’i değişirse burası güncellenir.
+        await page.wait_for_selector("text=Sarrafiye", timeout=20000)
+
+        # Tablo metinlerini al
+        html = await page.content()
+
+        # --- Sarrafiye tablosundan "Eski" fiyatları çek ---
+        # Tablo genelde şu kolonlarla geliyor: Yeni Alış / Yeni Satış / Eski Alış / Eski Satış
+        # Biz "Eski Alış" ve "Eski Satış" istiyoruz.
+        # En sağlam yol: satır bazlı regex.
+        def find_row_prices(row_name: str):
+            # row_name örn "ÇEYREK"
+            # satırda 4 fiyat var, biz 3. ve 4. (eski alış/satış) alacağız
+            # Örnek satır görüntüsü: ÇEYREK ... ₺12,120 ₺12,285 ₺11,955 ₺12,150
+            # Fiyat desenleri: ₺12,150 / ₺12.150 / 5191.36 vs
+            pattern = rf"{re.escape(row_name)}.*?(₺?\s*[\d\.,]+).*?(₺?\s*[\d\.,]+).*?(₺?\s*[\d\.,]+).*?(₺?\s*[\d\.,]+)"
+            m = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
+            if not m:
+                return None, None, None, None
+            p1, p2, p3, p4 = m.group(1), m.group(2), m.group(3), m.group(4)
+            return p1, p2, p3, p4
+
+        results: Dict[str, Any] = {}
+        for it in ITEMS:
+            if it["type"] == "sarrafiye_eski":
+                _, _, eski_alis_raw, eski_satis_raw = find_row_prices(it["ozbag_row"])
+                buy = _to_float(eski_alis_raw)
+                sell = _to_float(eski_satis_raw)
+                buy, sell = _apply_margin(it["key"], buy, sell)
+                results[it["key"]] = {"buy": buy, "sell": sell}
+
+        # --- Ons Altın paneli ---
+        # Sayfada "ALTIN / ONS" kartı var. İçinde iki sayı: Alış / Satış.
+        ons_pattern = r"ALTIN\s*/\s*ONS.*?Alış.*?([\d\.,]+).*?Satış.*?([\d\.,]+)"
+        om = re.search(ons_pattern, html, flags=re.IGNORECASE | re.DOTALL)
+        if om:
+            ons_buy = _to_float(om.group(1))
+            ons_sell = _to_float(om.group(2))
         else:
-            # sometimes first row acts as header
-            first_tr = table.find("tr")
-            if first_tr:
-                headers = [normalize_label(x.get_text(" ", strip=True)) for x in first_tr.find_all(["th", "td"])]
+            # alternatif: sadece "ONS" geçen blokları yakala
+            ons_buy = None
+            ons_sell = None
 
-        # detect sarrafiye 4 columns style
-        # "YENI ALIS", "YENI SATIS", "ESKI ALIS", "ESKI SATIS"
-        has_sarrafiye_headers = any("YENI ALIS" in h for h in headers) and any("ESKI SATIS" in h for h in headers)
+        ons_buy, ons_sell = _apply_margin("ONS_ALTIN", ons_buy, ons_sell)
+        results["ONS_ALTIN"] = {"buy": ons_buy, "sell": ons_sell}
 
-        for tr in table.find_all("tr"):
-            tds = tr.find_all(["td", "th"])
-            if len(tds) < 2:
-                continue
-            label_raw = tds[0].get_text(" ", strip=True)
-            label = normalize_label(label_raw)
-            if not label:
-                continue
+        # timestamp çıkar (sayfada saat var)
+        ts_match = re.search(r"\b(\d{2}:\d{2}:\d{2})\b", html)
+        updated_at = ts_match.group(1) if ts_match else None
 
-            # If sarrafiye-like, expect 5 columns: label + 4 prices
-            if has_sarrafiye_headers and len(tds) >= 5:
-                yeni_alis = parse_price(tds[1].get_text(" ", strip=True))
-                yeni_satis = parse_price(tds[2].get_text(" ", strip=True))
-                eski_alis = parse_price(tds[3].get_text(" ", strip=True))
-                eski_satis = parse_price(tds[4].get_text(" ", strip=True))
-                if any(v is not None for v in [yeni_alis, yeni_satis, eski_alis, eski_satis]):
-                    rows_map[label] = {
-                        "sarrafiye": {
-                            "yeni_alis": yeni_alis,
-                            "yeni_satis": yeni_satis,
-                            "eski_alis": eski_alis,
-                            "eski_satis": eski_satis,
-                        }
-                    }
-            else:
-                # Generic 2-price row (for ONS, gram, etc): label + buy + sell
-                # Try find first two numeric-like cells after label
-                nums = []
-                for td in tds[1:]:
-                    v = parse_price(td.get_text(" ", strip=True))
-                    if v is not None:
-                        nums.append(v)
-                    if len(nums) >= 2:
-                        break
-                if len(nums) >= 2:
-                    rows_map[label] = {"generic": {"alis": nums[0], "satis": nums[1]}}
+        await context.close()
+        await browser.close()
 
-    return rows_map
-
-def build_payload(rows_map: Dict[str, Any]) -> Dict[str, Any]:
-    out_items = []
-    for key, display_name, oz_label, mode in PRODUCTS:
-        target = normalize_label(oz_label)
-
-        alis = None
-        satis = None
-
-        row = rows_map.get(target)
-        if row:
-            if mode == "ESKI" and "sarrafiye" in row:
-                alis = row["sarrafiye"].get("eski_alis")
-                satis = row["sarrafiye"].get("eski_satis")
-            elif mode == "GENEL":
-                # prefer generic if exists; otherwise try sarrafiye yeni
-                if "generic" in row:
-                    alis = row["generic"].get("alis")
-                    satis = row["generic"].get("satis")
-                elif "sarrafiye" in row:
-                    alis = row["sarrafiye"].get("yeni_alis")
-                    satis = row["sarrafiye"].get("yeni_satis")
-
-        adj = apply_margin(key, alis, satis)
-
-        out_items.append({
-            "key": key,
-            "name": display_name,
-            "alis": adj["alis"],
-            "satis": adj["satis"],
-        })
-
-    return {
-        "ok": True,
-        "ts": int(now_ts()),
-        "items": out_items,
-    }
-
-def get_prices(force: bool = False) -> Dict[str, Any]:
-    # Serve fresh if cache valid
-    age = now_ts() - float(_cache["ts"] or 0)
-    if (not force) and _cache["data"] is not None and age < CACHE_TTL_SECONDS:
-        payload = dict(_cache["data"])
-        payload["meta"] = {
-            "source": "CACHE",
-            "cache_age_sec": int(age),
-            "last_error": _cache["error"],
-            "ozbag_url": OZBAG_SOURCE_URL,
+        return {
+            "items": results,
+            "updated_at": updated_at,
         }
-        return payload
 
-    # Try fetch from Ozbag
+
+async def get_prices_cached(force: bool = False) -> Dict[str, Any]:
+    fresh = (_now() - int(_cache["ts"])) < CACHE_TTL_SECONDS
+    if (not force) and fresh and _cache["data"]:
+        return {
+            "ok": True,
+            "source": _cache["source"],
+            "data": _cache["data"],
+            "error": _cache["error"],
+            "ts": _cache["ts"],
+            "last_ok_ts": _cache["last_ok_ts"],
+        }
+
     try:
-        html = fetch_html_requests(OZBAG_SOURCE_URL)
-        rows_map = extract_tables(html)
-        payload = build_payload(rows_map)
-
-        # If almost everything is None -> treat as failure (page blocked or structure changed)
-        none_count = sum(1 for it in payload["items"] if it["alis"] is None and it["satis"] is None)
-        if none_count >= len(payload["items"]) - 1:
-            raise RuntimeError("Ozbag page parsed but prices not found (structure changed or blocked).")
-
-        _cache["ts"] = now_ts()
-        _cache["data"] = payload
+        data = await fetch_ozbag_prices()
+        _cache["data"] = data
+        _cache["ts"] = _now()
+        _cache["last_ok_ts"] = _cache["ts"]
         _cache["source"] = "OZBAG"
         _cache["error"] = None
-
-        payload["meta"] = {
-            "source": "OZBAG",
-            "cache_age_sec": 0,
-            "last_error": None,
-            "ozbag_url": OZBAG_SOURCE_URL,
-        }
-        return payload
-
     except Exception as e:
-        # If we have old cache -> serve it
+        # Özbağ düşerse / 403 olursa: cache varsa onu göster
+        _cache["ts"] = _now()
+        _cache["source"] = "CACHE" if _cache["data"] else "YEDEK"
         _cache["error"] = str(e)
-        if _cache["data"] is not None:
-            payload = dict(_cache["data"])
-            payload["meta"] = {
-                "source": "CACHE",
-                "cache_age_sec": int(now_ts() - float(_cache["ts"] or 0)),
-                "last_error": str(e),
-                "ozbag_url": OZBAG_SOURCE_URL,
-            }
-            return payload
 
-        # No cache -> return YEDEK
-        return {
-            "ok": False,
-            "ts": int(now_ts()),
-            "items": [{"key": k, "name": n, "alis": None, "satis": None} for k, n, _, _ in PRODUCTS],
-            "meta": {
-                "source": "YEDEK",
-                "cache_age_sec": None,
-                "last_error": str(e),
-                "ozbag_url": OZBAG_SOURCE_URL,
-            }
-        }
+    return {
+        "ok": _cache["data"] is not None,
+        "source": _cache["source"],
+        "data": _cache["data"],
+        "error": _cache["error"],
+        "ts": _cache["ts"],
+        "last_ok_ts": _cache["last_ok_ts"],
+    }
 
-# ------------------------------------------------------------
-# FastAPI app
-# ------------------------------------------------------------
-app = FastAPI(title="Sarıkaya Kuyumculuk TV", version="1.0.0")
 
-# Static folder (put logo.png under ./static/logo.png)
-if os.path.isdir("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
+# =========================
+# API
+# =========================
 @app.get("/api/prices")
-def api_prices():
-    return JSONResponse(get_prices(force=True))
+async def api_prices():
+    payload = await get_prices_cached(force=False)
+    return JSONResponse(payload)
 
-@app.get("/", response_class=HTMLResponse)
-def root():
-    return tv()
 
+# =========================
+# TV EKRANI
+# =========================
 @app.get("/tv", response_class=HTMLResponse)
-def tv():
-    # Simple TV page with animated price updates
-    return HTMLResponse(f"""
+async def tv():
+    # İlk load’da da cache’i hazırla
+    initial = await get_prices_cached(force=True)
+
+    # HTML + CSS + JS tek dosyada
+    html = f"""
 <!doctype html>
 <html lang="tr">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Sarıkaya Kuyumculuk • Canlı Fiyat Ekranı</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Sarıkaya Kuyumculuk - Canlı Fiyat Ekranı</title>
   <style>
     :root {{
-      --bg: #0a0a0d;
-      --card: rgba(18,18,22,.78);
-      --stroke: rgba(212,175,55,.33);
+      --bg: #07070a;
+      --card: rgba(255,255,255,0.06);
+      --border: rgba(212,175,55,0.35);
       --gold: #d4af37;
-      --text: #f4f4f6;
-      --muted: rgba(244,244,246,.55);
-      --ok: #2ecc71;
-      --warn: #e74c3c;
+      --text: #f2f2f2;
+      --muted: rgba(255,255,255,0.55);
+      --good: rgba(39, 174, 96, 0.55);
+      --bad: rgba(231, 76, 60, 0.55);
     }}
-    * {{ box-sizing: border-box; }}
+    * {{ box-sizing: border-box; font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Arial,sans-serif; }}
     body {{
-      margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-      background: radial-gradient(1200px 600px at 20% 0%, rgba(212,175,55,.08), transparent 60%),
-                  radial-gradient(900px 500px at 100% 10%, rgba(100,100,255,.07), transparent 55%),
+      margin:0; color:var(--text);
+      background: radial-gradient(1200px 600px at 20% 10%, rgba(212,175,55,0.15), transparent 60%),
+                  radial-gradient(900px 500px at 80% 30%, rgba(212,175,55,0.10), transparent 60%),
                   var(--bg);
-      color: var(--text);
-    }}
-    .wrap {{
-      padding: 28px 28px 18px;
-      max-width: 1400px;
-      margin: 0 auto;
+      overflow-x:hidden;
     }}
     .top {{
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 16px;
-      align-items: center;
-      margin-bottom: 18px;
+      display:flex; justify-content:space-between; align-items:flex-end;
+      padding: 28px 32px 10px 32px;
     }}
     .brand {{
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      min-width: 0;
+      display:flex; gap:14px; align-items:center;
     }}
     .logo {{
-      width: 46px;
-      height: 46px;
-      border-radius: 14px;
-      background: rgba(255,255,255,.06);
-      border: 1px solid rgba(255,255,255,.08);
+      width:48px; height:48px; border-radius:14px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.09), rgba(255,255,255,0.03));
+      border:1px solid rgba(255,255,255,0.10);
       display:flex; align-items:center; justify-content:center;
-      overflow:hidden;
+      color:var(--gold); font-weight:800;
     }}
-    .logo img {{ width: 100%; height: 100%; object-fit: cover; }}
-    .title {{
-      min-width: 0;
-    }}
-    .title h1 {{
-      margin: 0;
-      font-size: 34px;
-      letter-spacing: .6px;
-      color: var(--gold);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }}
-    .title .sub {{
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 16px;
-    }}
+    .title h1 {{ margin:0; font-size:34px; letter-spacing:0.5px; color:var(--gold); }}
+    .title .sub {{ margin-top:4px; color:var(--muted); font-size:16px; }}
     .clock {{
-      text-align: right;
+      text-align:right;
     }}
-    .clock .t {{
-      font-size: 54px;
-      font-weight: 700;
-      letter-spacing: 1px;
-    }}
-    .clock .d {{
-      color: var(--muted);
-      font-size: 18px;
-      margin-top: 6px;
-    }}
-
+    .clock .time {{ font-size:64px; font-weight:800; line-height:1; }}
+    .clock .date {{ color:var(--muted); margin-top:6px; font-size:18px; }}
     .grid {{
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      display:grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 18px;
+      padding: 18px 32px 32px 32px;
+      max-width: 1100px;
+    }}
+    @media (min-width: 980px) {{
+      .grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
     }}
     .card {{
       background: var(--card);
-      border: 1px solid var(--stroke);
-      border-radius: 26px;
-      padding: 18px 18px 16px;
-      min-height: 190px;
-      position: relative;
-      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      padding: 18px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.30);
+      position:relative;
+      overflow:hidden;
     }}
     .card:before {{
       content:"";
-      position:absolute; inset:-1px;
-      background: radial-gradient(600px 220px at 30% 0%, rgba(212,175,55,.10), transparent 60%);
+      position:absolute; inset:-2px;
+      background: radial-gradient(600px 240px at 20% 10%, rgba(212,175,55,0.22), transparent 60%);
+      opacity:0.35;
       pointer-events:none;
     }}
-    .name {{
-      position: relative;
-      font-size: 20px;
-      letter-spacing: 2px;
-      color: rgba(244,244,246,.78);
-      font-weight: 700;
+    .card h2 {{
+      margin:0 0 14px 0;
+      font-size: 22px;
+      letter-spacing: 0.8px;
+      color: rgba(255,255,255,0.78);
     }}
-    .prices {{
-      position: relative;
-      display: grid;
+    .row {{
+      display:grid;
       grid-template-columns: 1fr 1fr;
-      gap: 10px;
-      margin-top: 14px;
-    }}
-    .pbox {{
-      border-radius: 18px;
-      border: 1px solid rgba(255,255,255,.08);
-      background: rgba(0,0,0,.12);
-      padding: 12px 14px;
-    }}
-    .plabel {{
-      font-size: 12px;
-      letter-spacing: 2px;
-      color: var(--muted);
-      margin-bottom: 8px;
-    }}
-    .pval {{
-      font-size: 40px;
-      font-weight: 800;
-      letter-spacing: .5px;
-      display:flex;
-      align-items: baseline;
-      gap: 8px;
-    }}
-    .cur {{
-      color: var(--gold);
-      font-weight: 800;
-      font-size: 34px;
-    }}
-    .meta {{
-      position: relative;
-      display:flex;
       gap: 12px;
-      margin-top: 14px;
-      flex-wrap: wrap;
+    }}
+    .box {{
+      border-radius: 18px;
+      background: rgba(0,0,0,0.22);
+      border: 1px solid rgba(255,255,255,0.10);
+      padding: 14px 14px 10px 14px;
+      min-height: 92px;
+      position:relative;
+      overflow:hidden;
+    }}
+    .box .lbl {{
+      color: rgba(255,255,255,0.55);
+      font-size: 13px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+    }}
+    .box .val {{
+      margin-top: 10px;
+      font-size: 34px;
+      font-weight: 800;
+      letter-spacing: 0.6px;
+      display:flex;
+      align-items:baseline;
+      gap:10px;
+    }}
+    .box .val .cur {{ color: var(--gold); font-weight:800; }}
+    .meta {{
+      display:flex; gap:10px; flex-wrap:wrap;
+      padding: 0 32px 30px 32px;
+      max-width: 1100px;
     }}
     .pill {{
-      padding: 10px 14px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.10);
+      color: rgba(255,255,255,0.75);
       border-radius: 999px;
-      background: rgba(255,255,255,.06);
-      border: 1px solid rgba(255,255,255,.08);
-      color: rgba(244,244,246,.78);
+      padding: 10px 14px;
       font-size: 14px;
-      display:flex;
-      gap: 10px;
-      align-items:center;
+      display:flex; align-items:center; gap:10px;
     }}
     .dot {{
       width:10px; height:10px; border-radius:50%;
-      background: var(--ok);
+      background: #2ecc71;
+      box-shadow: 0 0 10px rgba(46,204,113,0.7);
     }}
-    .dot.warn {{ background: var(--warn); }}
-    .small {{
-      color: var(--muted);
-      font-size: 14px;
-      margin-left: auto;
+    .dot.red {{
+      background:#e74c3c;
+      box-shadow: 0 0 10px rgba(231,76,60,0.7);
     }}
-
-    /* price animation */
-    .flash-up {{ animation: flashUp .65s ease; }}
-    .flash-down {{ animation: flashDown .65s ease; }}
+    .flash-up {{ animation: flashUp 0.6s ease-out; }}
+    .flash-down {{ animation: flashDown 0.6s ease-out; }}
     @keyframes flashUp {{
-      0% {{ transform: translateY(0); }}
-      30% {{ transform: translateY(-2px); }}
-      100% {{ transform: translateY(0); }}
+      0% {{ background: rgba(39,174,96,0.45); }}
+      100% {{ background: rgba(0,0,0,0.22); }}
     }}
     @keyframes flashDown {{
-      0% {{ transform: translateY(0); }}
-      30% {{ transform: translateY(2px); }}
-      100% {{ transform: translateY(0); }}
+      0% {{ background: rgba(231,76,60,0.45); }}
+      100% {{ background: rgba(0,0,0,0.22); }}
     }}
-
-    @media (max-width: 1100px) {{
-      .grid {{ grid-template-columns: repeat(2, 1fr); }}
-      .clock .t {{ font-size: 44px; }}
-    }}
-    @media (max-width: 720px) {{
-      .grid {{ grid-template-columns: 1fr; }}
-      .clock {{ text-align: left; }}
-      .top {{ grid-template-columns: 1fr; }}
+    .footer {{
+      padding: 0 32px 26px 32px;
+      color: rgba(255,255,255,0.35);
+      max-width: 1100px;
+      font-size: 13px;
     }}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="top">
-      <div class="brand">
-        <div class="logo">
-          <img src="{LOGO_URL}" onerror="this.style.display='none'"/>
-        </div>
-        <div class="title">
-          <h1>SARIKAYA KUYUMCULUK</h1>
-          <div class="sub">Canlı Fiyat Ekranı • TV</div>
-        </div>
-      </div>
-      <div class="clock">
-        <div class="t" id="clock">--:--</div>
-        <div class="d" id="date">--</div>
+  <div class="top">
+    <div class="brand">
+      <div class="logo">SK</div>
+      <div class="title">
+        <h1>SARIKAYA KUYUMCULUK</h1>
+        <div class="sub">Canlı Fiyat Ekranı • TV</div>
       </div>
     </div>
-
-    <div class="grid" id="grid"></div>
-
-    <div class="meta">
-      <div class="pill"><span class="dot" id="dot"></span><span id="statusText">Otomatik güncelleniyor</span></div>
-      <div class="pill">Kaynak: <b id="source">-</b></div>
-      <div class="pill">Son güncelleme: <b id="lastUpdate">-</b></div>
-      <div class="pill">Hayırlı işler dileriz</div>
-      <div class="small" id="err"></div>
+    <div class="clock">
+      <div class="time" id="clockTime">--:--</div>
+      <div class="date" id="clockDate">--</div>
     </div>
   </div>
 
+  <div class="grid" id="grid"></div>
+
+  <div class="meta">
+    <div class="pill"><span class="dot" id="autoDot"></span><span id="autoTxt">Otomatik güncelleniyor</span></div>
+    <div class="pill">Kaynak: <b id="srcTxt">{initial.get("source","-")}</b></div>
+    <div class="pill">Son güncelleme: <b id="updTxt">--</b></div>
+    <div class="pill" id="errPill" style="display:none;">Hata: <span id="errTxt"></span></div>
+    <div class="pill" style="margin-left:auto;">Hayırlı işler dileriz</div>
+  </div>
+
+  <div class="footer">
+    Not: Özbağ erişilemezse sistem otomatik olarak Cache/Yedek verisiyle devam eder.
+  </div>
+
 <script>
-  const fmtTRY = (v) => {{
-    if (v === null || v === undefined) return "--";
-    const n = Math.round(v);
-    return n.toString().replace(/\\B(?=(\\d{{3}})+(?!\\d))/g, ".");
-  }};
+  const ITEMS = {json.dumps([{ "key": i["key"], "label": i["label"] } for i in ITEMS], ensure_ascii=False)};
 
-  const state = {{
-    last: {{}},
-    lastTs: 0
-  }};
+  let prev = {{}};
 
-  function setClock() {{
-    const d = new Date();
-    const hh = String(d.getHours()).padStart(2,'0');
-    const mm = String(d.getMinutes()).padStart(2,'0');
-    document.getElementById('clock').textContent = `${{hh}}:${{mm}}`;
-    const tr = d.toLocaleDateString('tr-TR', {{ weekday:'long', year:'numeric', month:'long', day:'numeric' }});
-    document.getElementById('date').textContent = tr.charAt(0).toUpperCase() + tr.slice(1);
+  function fmt(v) {{
+    if (v === null || v === undefined || isNaN(v)) return "--";
+    const n = Number(v);
+    // TR para formatı: 12.150
+    return n.toLocaleString("tr-TR", {{ maximumFractionDigits: 0 }});
   }}
-  setInterval(setClock, 1000);
-  setClock();
 
-  function cardHTML(item) {{
-    const key = item.key;
-    return `
-      <div class="card" data-key="${{key}}">
-        <div class="name">${{item.name}}</div>
-        <div class="prices">
-          <div class="pbox">
-            <div class="plabel">ALIŞ</div>
-            <div class="pval" id="alis-${{key}}">-- <span class="cur">₺</span></div>
+  function build() {{
+    const grid = document.getElementById("grid");
+    grid.innerHTML = "";
+    for (const it of ITEMS) {{
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML = `
+        <h2>${{it.label}}</h2>
+        <div class="row">
+          <div class="box" data-k="${{it.key}}:buy">
+            <div class="lbl">ALIŞ</div>
+            <div class="val"><span class="num">--</span> <span class="cur">₺</span></div>
           </div>
-          <div class="pbox">
-            <div class="plabel">SATIŞ</div>
-            <div class="pval" id="satis-${{key}}">-- <span class="cur">₺</span></div>
+          <div class="box" data-k="${{it.key}}:sell">
+            <div class="lbl">SATIŞ</div>
+            <div class="val"><span class="num">--</span> <span class="cur">₺</span></div>
           </div>
         </div>
-      </div>
-    `;
-  }}
-
-  function renderGrid(items) {{
-    const grid = document.getElementById('grid');
-    grid.innerHTML = items.map(cardHTML).join('');
-  }}
-
-  function flash(el, dir) {{
-    el.classList.remove('flash-up','flash-down');
-    void el.offsetWidth; // reflow
-    el.classList.add(dir > 0 ? 'flash-up' : 'flash-down');
-  }}
-
-  function updateValues(items) {{
-    for (const it of items) {{
-      const key = it.key;
-      const aEl = document.getElementById(`alis-${{key}}`);
-      const sEl = document.getElementById(`satis-${{key}}`);
-
-      const prev = state.last[key] || {{}};
-      const newA = it.alis;
-      const newS = it.satis;
-
-      if (aEl) {{
-        aEl.firstChild && (aEl.firstChild.textContent = fmtTRY(newA) + " ");
-        if (prev.alis !== undefined && newA !== null && prev.alis !== null && newA !== prev.alis) {{
-          flash(aEl, newA > prev.alis ? 1 : -1);
-        }}
-      }}
-      if (sEl) {{
-        sEl.firstChild && (sEl.firstChild.textContent = fmtTRY(newS) + " ");
-        if (prev.satis !== undefined && newS !== null && prev.satis !== null && newS !== prev.satis) {{
-          flash(sEl, newS > prev.satis ? 1 : -1);
-        }}
-      }}
-
-      state.last[key] = {{ alis: newA, satis: newS }};
+      `;
+      grid.appendChild(card);
     }}
+  }}
+
+  function setBox(key, value) {{
+    const box = document.querySelector(`.box[data-k="${{key}}"]`);
+    if (!box) return;
+    const num = box.querySelector(".num");
+    const old = prev[key];
+    num.textContent = fmt(value);
+
+    if (old !== undefined && value !== null && value !== undefined && !isNaN(value) && old !== value) {{
+      box.classList.remove("flash-up", "flash-down");
+      void box.offsetWidth; // reflow
+      if (value > old) box.classList.add("flash-up");
+      else box.classList.add("flash-down");
+    }}
+    prev[key] = value;
+  }}
+
+  function updateClock() {{
+    const d = new Date();
+    const t = d.toLocaleTimeString("tr-TR", {{hour:"2-digit", minute:"2-digit"}});
+    const day = d.toLocaleDateString("tr-TR", {{ day:"numeric", month:"long", year:"numeric", weekday:"long" }});
+    document.getElementById("clockTime").textContent = t;
+    document.getElementById("clockDate").textContent = day;
   }}
 
   async function tick() {{
     try {{
-      const res = await fetch('/api/prices', {{ cache: 'no-store' }});
-      const data = await res.json();
+      const r = await fetch("/api/prices", {{ cache: "no-store" }});
+      const j = await r.json();
 
-      if (!document.getElementById('grid').children.length) {{
-        renderGrid(data.items);
+      document.getElementById("srcTxt").textContent = j.source || "-";
+      const ok = !!j.ok;
+      const dot = document.getElementById("autoDot");
+      dot.classList.toggle("red", !ok);
+      document.getElementById("autoTxt").textContent = ok ? "Otomatik güncelleniyor" : "Cache/Yedek kullanılıyor";
+
+      // hata
+      const errPill = document.getElementById("errPill");
+      if (j.error) {{
+        errPill.style.display = "flex";
+        document.getElementById("errTxt").textContent = j.error;
+      }} else {{
+        errPill.style.display = "none";
       }}
 
-      updateValues(data.items);
+      if (j.data && j.data.items) {{
+        // güncelleme saati
+        document.getElementById("updTxt").textContent = (j.data.updated_at || new Date().toLocaleTimeString("tr-TR"));
 
-      const meta = data.meta || {{}};
-      document.getElementById('source').textContent = meta.source || '-';
-      document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('tr-TR');
-      document.getElementById('err').textContent = meta.last_error ? ("Hata: " + meta.last_error) : "";
-
-      const dot = document.getElementById('dot');
-      const statusText = document.getElementById('statusText');
-      if (meta.source === "OZBAG") {{
-        dot.classList.remove('warn');
-        statusText.textContent = "Otomatik güncelleniyor";
-      }} else {{
-        dot.classList.add('warn');
-        statusText.textContent = "Cache (geçici) kullanılıyor";
+        for (const it of ITEMS) {{
+          const obj = j.data.items[it.key] || {{}};
+          setBox(`${{it.key}}:buy`, obj.buy);
+          setBox(`${{it.key}}:sell`, obj.sell);
+        }}
       }}
     }} catch (e) {{
-      const dot = document.getElementById('dot');
-      dot.classList.add('warn');
-      document.getElementById('statusText').textContent = "Bağlantı hatası";
-      document.getElementById('err').textContent = "Hata: " + e;
+      const dot = document.getElementById("autoDot");
+      dot.classList.add("red");
+      document.getElementById("autoTxt").textContent = "Cache/Yedek kullanılıyor";
+      const errPill = document.getElementById("errPill");
+      errPill.style.display = "flex";
+      document.getElementById("errTxt").textContent = String(e);
     }}
   }}
 
+  build();
+  updateClock();
+  setInterval(updateClock, 1000);
   tick();
-  setInterval(tick, 5000);
+  setInterval(tick, {max(5, CACHE_TTL_SECONDS)} * 1000);
 </script>
 </body>
 </html>
-    """)
-
-# Helpful debug endpoint (optional)
-@app.get("/debug", response_class=JSONResponse)
-def debug():
-    return JSONResponse({
-        "OZBAG_SOURCE_URL": OZBAG_SOURCE_URL,
-        "CACHE_TTL_SECONDS": CACHE_TTL_SECONDS,
-        "LOGO_URL": LOGO_URL,
-        "MARGINS": MARGINS,
-    })
+"""
+    return HTMLResponse(html)

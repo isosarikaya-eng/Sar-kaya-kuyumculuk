@@ -1,653 +1,539 @@
 import os
 import re
-import time
 import json
-from datetime import datetime, timezone
+import time
+from typing import Dict, Any, Optional
 
 import requests
 from bs4 import BeautifulSoup
 
-from flask import Flask, jsonify, Response, request, render_template_string, send_from_directory
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-# =========================
-# Config
-# =========================
-APP_NAME = os.getenv("APP_NAME", "Sarıkaya Kuyumculuk")
-OZBAG_SITE_URL = (os.getenv("OZBAG_SITE_URL", "https://www.ozbag.com") or "").strip().rstrip("/")
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "30") or "30")
-LOGO_URL = (os.getenv("LOGO_URL", "/static/logo.png") or "/static/logo.png").strip()
-PORT = int(os.getenv("PORT", "8080") or "8080")
+# ------------------------------------------------------------
+# Config (Railway Variables)
+# ------------------------------------------------------------
+OZBAG_SOURCE_URL = os.getenv("OZBAG_SOURCE_URL", "https://www.ozbag.com/").strip()
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "30").strip())
+LOGO_URL = os.getenv("LOGO_URL", "/static/logo.png").strip()
 
-# Request tuning
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "8") or "8")
-USER_AGENT = os.getenv(
-    "USER_AGENT",
-    "Mozilla/5.0 (compatible; SarikayaPriceBoard/1.0; +https://example.com)"
-)
+# Margin system (optional)
+# You can set MARGINS_JSON as a JSON string in Railway:
+# {
+#   "ESKI_CEYREK": {"alis_add": 0, "satis_add": 0, "alis_mul": 1.0, "satis_mul": 1.0},
+#   "ONS": {"alis_add": 0, "satis_add": 0, "alis_mul": 1.0, "satis_mul": 1.0}
+# }
+MARGINS_JSON_RAW = os.getenv("MARGINS_JSON", "").strip()
 
-# =========================
-# App
-# =========================
-app = Flask(__name__, static_folder="static", static_url_path="/static")
-
-_session = requests.Session()
-_session.headers.update({"User-Agent": USER_AGENT})
-
-# In-memory cache
-_cache = {
-    "ts": 0.0,               # unix seconds
-    "data": None,            # last good payload
-    "source": "EMPTY",       # OZBAG_JSON | OZBAG_HTML | CACHE | EMPTY
-    "error": None,           # last error string
+DEFAULT_MARGINS: Dict[str, Dict[str, float]] = {
+    # key: {alis_add, satis_add, alis_mul, satis_mul}
+    "ESKI_CEYREK": {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0},
+    "ESKI_YARIM":  {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0},
+    "ESKI_TAM":    {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0},
+    "ESKI_GRAMSE": {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0},
+    "ESKI_ATA":    {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0},
+    "ONS":         {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0},
 }
 
-# =========================
+def load_margins() -> Dict[str, Dict[str, float]]:
+    margins = dict(DEFAULT_MARGINS)
+    if not MARGINS_JSON_RAW:
+        return margins
+    try:
+        user = json.loads(MARGINS_JSON_RAW)
+        if isinstance(user, dict):
+            for k, v in user.items():
+                if isinstance(v, dict):
+                    margins[k] = {
+                        "alis_add": float(v.get("alis_add", margins.get(k, {}).get("alis_add", 0.0))),
+                        "satis_add": float(v.get("satis_add", margins.get(k, {}).get("satis_add", 0.0))),
+                        "alis_mul": float(v.get("alis_mul", margins.get(k, {}).get("alis_mul", 1.0))),
+                        "satis_mul": float(v.get("satis_mul", margins.get(k, {}).get("satis_mul", 1.0))),
+                    }
+    except Exception:
+        # If margins JSON is broken, ignore and use defaults
+        return dict(DEFAULT_MARGINS)
+    return margins
+
+MARGINS = load_margins()
+
+# ------------------------------------------------------------
+# Product mapping
+# ------------------------------------------------------------
+# We will scrape Ozbag "Sarrafiye" table:
+# Columns usually: Yeni Alış, Yeni Satış, Eski Alış, Eski Satış
+# You asked: Eski Çeyrek/Yarım/Tam/Gramse/Ata (alış+satış) + Ons alış+satış
+#
+# NOTE: "ONS" might be under another section ("Altın Fiyatları") not the Sarrafiye table.
+# This app will try to find it anywhere in tables by label matching.
+PRODUCTS = [
+    # key, display_name, ozbag_row_label, which columns to use
+    ("ESKI_CEYREK", "Eski Çeyrek", "ÇEYREK", "ESKI"),
+    ("ESKI_YARIM",  "Eski Yarım",  "YARIM",  "ESKI"),
+    ("ESKI_TAM",    "Eski Tam",    "TAM",    "ESKI"),
+    ("ESKI_GRAMSE", "Eski Gramse", "GRAMSE", "ESKI"),
+    ("ESKI_ATA",    "Eski Ata",    "ATA",    "ESKI"),
+    ("ONS",         "Ons Altın",   "ONS",    "GENEL"),
+]
+
+# ------------------------------------------------------------
+# Simple in-memory cache
+# ------------------------------------------------------------
+_cache: Dict[str, Any] = {
+    "ts": 0.0,
+    "data": None,       # last good payload
+    "source": "YEDEK",  # OZBAG / CACHE / YEDEK
+    "error": None
+}
+
+# ------------------------------------------------------------
 # Helpers
-# =========================
-def now_tr():
-    # Turkey time display (UTC+3)
-    return datetime.now(timezone.utc).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+# ------------------------------------------------------------
+def now_ts() -> float:
+    return time.time()
 
-def _try_get(url: str) -> requests.Response:
-    return _session.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+def normalize_label(s: str) -> str:
+    s = (s or "").strip().upper()
+    # Turkish normalize for common letters
+    s = s.replace("İ", "I").replace("İ", "I")
+    s = s.replace("Ş", "S").replace("Ğ", "G").replace("Ü", "U").replace("Ö", "O").replace("Ç", "C")
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-def _clean_number(s: str):
-    """
-    Accepts strings like "₺12,150" or "12.150" or "12,150" etc.
-    Returns float or None.
-    """
-    if not s:
+def parse_price(text: str) -> Optional[float]:
+    if not text:
         return None
-    t = s.strip()
-    t = t.replace("₺", "").replace("$", "").replace("€", "")
-    t = t.replace("\xa0", " ").strip()
-
-    # Common TR formats:
-    # 12.150 or 12,150 (can be thousands)
-    # Try to detect if comma is decimal or thousand:
-    # In OZBAG screenshot they use comma as thousands? Actually they show "₺12,120" (comma thousands),
-    # also sometimes dot as thousands in your UI ("12.150").
-    # We'll normalize to digits only, treating last separator carefully.
-    # Keep digits and separators
-    m = re.findall(r"[0-9]+|[.,]", t)
-    if not m:
+    t = text.strip()
+    # Keep digits, dot, comma
+    t = re.sub(r"[^\d\.,-]", "", t)
+    if not t:
         return None
-    t = "".join(m)
-
-    # If both separators exist, assume last one is decimal if followed by 1-2 digits; else thousands.
-    if "." in t and "," in t:
-        last_sep = "." if t.rfind(".") > t.rfind(",") else ","
-        parts = t.split(last_sep)
-        if len(parts) == 2 and len(parts[1]) in (1, 2):
-            # decimal
-            int_part = re.sub(r"[.,]", "", parts[0])
-            dec_part = re.sub(r"[.,]", "", parts[1])
-            t2 = f"{int_part}.{dec_part}"
-            try:
-                return float(t2)
-            except:
-                return None
-        else:
-            # thousands
-            t2 = re.sub(r"[.,]", "", t)
-            try:
-                return float(t2)
-            except:
-                return None
-
-    # Only one separator
-    if "," in t and "." not in t:
-        # If comma followed by 1-2 digits => decimal, else thousands
-        p = t.split(",")
-        if len(p) == 2 and len(p[1]) in (1, 2):
-            t2 = p[0].replace(",", "") + "." + p[1]
-            try:
-                return float(t2)
-            except:
-                return None
-        else:
-            t2 = t.replace(",", "")
-            try:
-                return float(t2)
-            except:
-                return None
-
-    if "." in t and "," not in t:
-        # If dot followed by 1-2 digits => decimal, else thousands
-        p = t.split(".")
-        if len(p) == 2 and len(p[1]) in (1, 2):
-            t2 = p[0].replace(".", "") + "." + p[1]
-            try:
-                return float(t2)
-            except:
-                return None
-        else:
-            t2 = t.replace(".", "")
-            try:
-                return float(t2)
-            except:
-                return None
-
-    # No separator
+    # Turkish style: 12.150 or 12,150
+    # If both exist, assume dot is thousand and comma is decimal (rare here)
+    if "," in t and "." in t:
+        # remove thousand separator dot
+        t = t.replace(".", "")
+        # use dot for decimal
+        t = t.replace(",", ".")
+    else:
+        # if comma only, treat as thousand or decimal -> most prices are integers, so remove commas
+        if "," in t and "." not in t:
+            t = t.replace(",", "")
+        # if dot only, treat as thousand separator -> remove dot
+        if "." in t and "," not in t:
+            # could be decimal, but in TR price tables it's almost always thousand separator
+            t = t.replace(".", "")
     try:
         return float(t)
-    except:
+    except Exception:
         return None
 
-def _format_try(value):
-    if value is None:
-        return "-"
-    # Prefer integer display if looks like integer
-    if abs(value - round(value)) < 1e-9:
-        v = int(round(value))
-        # format with dot thousands (TR-like)
-        return f"{v:,}".replace(",", ".")
-    return f"{value:.2f}"
+def apply_margin(key: str, alis: Optional[float], satis: Optional[float]) -> Dict[str, Optional[float]]:
+    m = MARGINS.get(key, {"alis_add": 0.0, "satis_add": 0.0, "alis_mul": 1.0, "satis_mul": 1.0})
+    if alis is not None:
+        alis = alis * float(m.get("alis_mul", 1.0)) + float(m.get("alis_add", 0.0))
+    if satis is not None:
+        satis = satis * float(m.get("satis_mul", 1.0)) + float(m.get("satis_add", 0.0))
+    return {"alis": alis, "satis": satis}
 
-def _normalize_key(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().upper())
-
-# =========================
-# OZBAG Parsers
-# =========================
-def fetch_from_ozbag_json():
-    """
-    Tries common JSON endpoints. If OZBAG actually provides an API, it'll succeed here.
-    If not, raises.
-    """
-    candidates = [
-        f"{OZBAG_SITE_URL}/api/prices",
-        f"{OZBAG_SITE_URL}/api/Prices",
-        f"{OZBAG_SITE_URL}/prices.json",
-        f"{OZBAG_SITE_URL}/data/prices.json",
-        f"{OZBAG_SITE_URL}/data.json",
-        f"{OZBAG_SITE_URL}/prices",
-    ]
-    last_err = None
-    for url in candidates:
-        try:
-            r = _try_get(url)
-            if r.status_code != 200:
-                last_err = f"{url} -> HTTP {r.status_code}"
-                continue
-            # try json
-            data = r.json()
-            return data, url
-        except Exception as e:
-            last_err = f"{url} -> {e}"
-            continue
-    raise RuntimeError(last_err or "No JSON endpoint worked")
-
-def _parse_sarrafiye_table_from_html(html: str):
-    """
-    Parses the Sarrafiye table shown in your screenshot (columns include Yeni Alış/Yeni Satış/Eski Alış/Eski Satış).
-    We NEED: Eski Alış / Eski Satış for: ÇEYREK, YARIM, TAM, GREMSE, ATA (and optionally ATA BEŞLİ).
-    Returns dict.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    tables = soup.find_all("table")
-    if not tables:
-        raise RuntimeError("No tables found in HTML")
-
-    target_table = None
-    header_map = None
-
-    # Find a table that has headers like "Yeni Alış" "Eski Alış" etc.
-    for t in tables:
-        # get header row text
-        ths = t.find_all(["th", "td"])
-        text_blob = " ".join(_normalize_key(x.get_text(" ", strip=True)) for x in ths[:20])
-        if "ESKI" in text_blob or "ESKİ" in text_blob:
-            # Try to build header indices from first row
-            rows = t.find_all("tr")
-            if not rows:
-                continue
-            first = rows[0].find_all(["th", "td"])
-            headers = [_normalize_key(c.get_text(" ", strip=True)) for c in first]
-            # Look for required columns
-            # We accept both ESKI and ESKİ
-            def find_col(name_variants):
-                for nv in name_variants:
-                    for i, h in enumerate(headers):
-                        if nv in h:
-                            return i
-                return None
-
-            idx_old_buy = find_col(["ESKI ALIS", "ESKİ ALIŞ"])
-            idx_old_sell = find_col(["ESKI SATIS", "ESKİ SATIŞ"])
-            if idx_old_buy is not None and idx_old_sell is not None:
-                target_table = t
-                header_map = {"old_buy": idx_old_buy, "old_sell": idx_old_sell}
-                break
-
-    if target_table is None:
-        raise RuntimeError("Sarrafiye table with 'Eski Alış/Eski Satış' not found")
-
-    rows = target_table.find_all("tr")
-    items = {}
-
-    for row in rows[1:]:
-        cols = row.find_all(["td", "th"])
-        if len(cols) < max(header_map.values()) + 1:
-            continue
-        name = _normalize_key(cols[0].get_text(" ", strip=True))
-        # Some pages may include time under name; keep only first token if needed
-        name = name.split("\n")[0].strip()
-        if not name:
-            continue
-
-        old_buy_txt = cols[header_map["old_buy"]].get_text(" ", strip=True)
-        old_sell_txt = cols[header_map["old_sell"]].get_text(" ", strip=True)
-
-        items[name] = {
-            "old_buy": _clean_number(old_buy_txt),
-            "old_sell": _clean_number(old_sell_txt),
-        }
-
-    # Map to requested products
-    def pick(key):
-        # allow diacritics
-        k = _normalize_key(key)
-        # direct
-        if k in items:
-            return items[k]
-        # fuzzy
-        for kk in items.keys():
-            if k in kk or kk in k:
-                return items[kk]
-        return {"old_buy": None, "old_sell": None}
-
-    result = {
-        "CEYREK": pick("ÇEYREK"),
-        "YARIM": pick("YARIM"),
-        "TAM": pick("TAM"),
-        "GREMSE": pick("GREMSE"),
-        "ATA": pick("ATA"),
-        "ATA_BESLI": pick("ATA BEŞLİ"),
+def fetch_html_requests(url: str, timeout: int = 20) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (TV-Price-App; +https://railway.app/)",
+        "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.7",
     }
-    return result
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.text
 
-def _parse_ons_from_html(html: str):
+def extract_tables(html: str) -> Dict[str, Dict[str, Dict[str, float]]]:
     """
-    Tries to find Ons Altın (ONS) buy/sell somewhere in the page.
-    Returns {"buy": float|None, "sell": float|None}
+    Return mapping:
+    {
+      "CEYREK": {"yeni_alis": x, "yeni_satis": y, "eski_alis": a, "eski_satis": b},
+      ...
+      "ONS": {"alis": x, "satis": y}  (if found in any table as 2-price row)
+    }
     """
     soup = BeautifulSoup(html, "lxml")
-    text = soup.get_text(" ", strip=True)
-    # If page contains a row-like structure for ONS, try tables first
     tables = soup.find_all("table")
-    for t in tables:
-        rows = t.find_all("tr")
-        for row in rows:
-            cols = row.find_all(["td", "th"])
-            if len(cols) < 3:
+    rows_map: Dict[str, Dict[str, Dict[str, float]]] = {}
+
+    for table in tables:
+        # read headers
+        headers = []
+        thead = table.find("thead")
+        if thead:
+            headers = [normalize_label(th.get_text(" ", strip=True)) for th in thead.find_all(["th", "td"])]
+        else:
+            # sometimes first row acts as header
+            first_tr = table.find("tr")
+            if first_tr:
+                headers = [normalize_label(x.get_text(" ", strip=True)) for x in first_tr.find_all(["th", "td"])]
+
+        # detect sarrafiye 4 columns style
+        # "YENI ALIS", "YENI SATIS", "ESKI ALIS", "ESKI SATIS"
+        has_sarrafiye_headers = any("YENI ALIS" in h for h in headers) and any("ESKI SATIS" in h for h in headers)
+
+        for tr in table.find_all("tr"):
+            tds = tr.find_all(["td", "th"])
+            if len(tds) < 2:
                 continue
-            name = _normalize_key(cols[0].get_text(" ", strip=True))
-            if "ONS" in name:
-                # Try next 2 columns as buy/sell
-                buy = _clean_number(cols[1].get_text(" ", strip=True))
-                sell = _clean_number(cols[2].get_text(" ", strip=True))
-                if buy is not None or sell is not None:
-                    return {"buy": buy, "sell": sell}
-
-    # fallback: regex on text
-    # very conservative, may fail silently (that's ok)
-    m = re.search(r"ONS[^0-9]{0,20}([0-9\.,]+)[^0-9]{0,20}([0-9\.,]+)", text.upper())
-    if m:
-        return {"buy": _clean_number(m.group(1)), "sell": _clean_number(m.group(2))}
-    return {"buy": None, "sell": None}
-
-def fetch_from_ozbag_html():
-    """
-    Fetches OZBAG site HTML and scrapes.
-    We try a few likely pages.
-    """
-    candidates = [
-        f"{OZBAG_SITE_URL}/sarrafiye",
-        f"{OZBAG_SITE_URL}/Sarrafiye",
-        f"{OZBAG_SITE_URL}/altin-fiyatlari",
-        f"{OZBAG_SITE_URL}/Altin-Fiyatlari",
-        f"{OZBAG_SITE_URL}/",
-    ]
-    last_err = None
-    for url in candidates:
-        try:
-            r = _try_get(url)
-            if r.status_code != 200:
-                last_err = f"{url} -> HTTP {r.status_code}"
+            label_raw = tds[0].get_text(" ", strip=True)
+            label = normalize_label(label_raw)
+            if not label:
                 continue
-            html = r.text
-            sarrafiye = _parse_sarrafiye_table_from_html(html)
-            ons = _parse_ons_from_html(html)
-            return {"sarrafiye": sarrafiye, "ons": ons}, url
-        except Exception as e:
-            last_err = f"{url} -> {e}"
-            continue
-    raise RuntimeError(last_err or "No HTML page could be parsed")
 
-# =========================
-# Core fetch with caching
-# =========================
-def get_prices(force: bool = False):
-    now = time.time()
-    fresh = (_cache["data"] is not None) and (now - _cache["ts"] < CACHE_TTL_SECONDS)
-    if fresh and not force:
+            # If sarrafiye-like, expect 5 columns: label + 4 prices
+            if has_sarrafiye_headers and len(tds) >= 5:
+                yeni_alis = parse_price(tds[1].get_text(" ", strip=True))
+                yeni_satis = parse_price(tds[2].get_text(" ", strip=True))
+                eski_alis = parse_price(tds[3].get_text(" ", strip=True))
+                eski_satis = parse_price(tds[4].get_text(" ", strip=True))
+                if any(v is not None for v in [yeni_alis, yeni_satis, eski_alis, eski_satis]):
+                    rows_map[label] = {
+                        "sarrafiye": {
+                            "yeni_alis": yeni_alis,
+                            "yeni_satis": yeni_satis,
+                            "eski_alis": eski_alis,
+                            "eski_satis": eski_satis,
+                        }
+                    }
+            else:
+                # Generic 2-price row (for ONS, gram, etc): label + buy + sell
+                # Try find first two numeric-like cells after label
+                nums = []
+                for td in tds[1:]:
+                    v = parse_price(td.get_text(" ", strip=True))
+                    if v is not None:
+                        nums.append(v)
+                    if len(nums) >= 2:
+                        break
+                if len(nums) >= 2:
+                    rows_map[label] = {"generic": {"alis": nums[0], "satis": nums[1]}}
+
+    return rows_map
+
+def build_payload(rows_map: Dict[str, Any]) -> Dict[str, Any]:
+    out_items = []
+    for key, display_name, oz_label, mode in PRODUCTS:
+        target = normalize_label(oz_label)
+
+        alis = None
+        satis = None
+
+        row = rows_map.get(target)
+        if row:
+            if mode == "ESKI" and "sarrafiye" in row:
+                alis = row["sarrafiye"].get("eski_alis")
+                satis = row["sarrafiye"].get("eski_satis")
+            elif mode == "GENEL":
+                # prefer generic if exists; otherwise try sarrafiye yeni
+                if "generic" in row:
+                    alis = row["generic"].get("alis")
+                    satis = row["generic"].get("satis")
+                elif "sarrafiye" in row:
+                    alis = row["sarrafiye"].get("yeni_alis")
+                    satis = row["sarrafiye"].get("yeni_satis")
+
+        adj = apply_margin(key, alis, satis)
+
+        out_items.append({
+            "key": key,
+            "name": display_name,
+            "alis": adj["alis"],
+            "satis": adj["satis"],
+        })
+
+    return {
+        "ok": True,
+        "ts": int(now_ts()),
+        "items": out_items,
+    }
+
+def get_prices(force: bool = False) -> Dict[str, Any]:
+    # Serve fresh if cache valid
+    age = now_ts() - float(_cache["ts"] or 0)
+    if (not force) and _cache["data"] is not None and age < CACHE_TTL_SECONDS:
         payload = dict(_cache["data"])
-        payload["meta"]["source"] = "CACHE"
-        payload["meta"]["cache_age_sec"] = int(now - _cache["ts"])
+        payload["meta"] = {
+            "source": "CACHE",
+            "cache_age_sec": int(age),
+            "last_error": _cache["error"],
+            "ozbag_url": OZBAG_SOURCE_URL,
+        }
         return payload
 
-    # Try JSON first, then HTML scrape
+    # Try fetch from Ozbag
     try:
-        # If JSON structure is unknown, we still keep it as debug, but prefer HTML path.
-        # We'll attempt JSON, but if it doesn't contain what we need, fallback.
-        jdata, jurl = fetch_from_ozbag_json()
-        # If json has expected keys, map them (optional)
-        # We don't assume structure; fallback to html scrape for reliability.
-        raise RuntimeError(f"JSON endpoint reachable but mapping unknown: {jurl}")
-    except Exception:
-        pass
+        html = fetch_html_requests(OZBAG_SOURCE_URL)
+        rows_map = extract_tables(html)
+        payload = build_payload(rows_map)
 
-    try:
-        hdata, hurl = fetch_from_ozbag_html()
+        # If almost everything is None -> treat as failure (page blocked or structure changed)
+        none_count = sum(1 for it in payload["items"] if it["alis"] is None and it["satis"] is None)
+        if none_count >= len(payload["items"]) - 1:
+            raise RuntimeError("Ozbag page parsed but prices not found (structure changed or blocked).")
 
-        sar = hdata["sarrafiye"]
-        ons = hdata["ons"]
-
-        payload = {
-            "meta": {
-                "app": APP_NAME,
-                "updated_at": datetime.now().strftime("%H:%M:%S"),
-                "date": datetime.now().strftime("%d %B %Y"),
-                "source": "OZBAG_HTML",
-                "source_url": hurl,
-                "cache_ttl_seconds": CACHE_TTL_SECONDS,
-                "cache_age_sec": 0,
-                "error": None,
-            },
-            "products": {
-                # requested "Eski" prices (old buy/sell)
-                "ESKI_CEYREK": {"buy": sar["CEYREK"]["old_buy"], "sell": sar["CEYREK"]["old_sell"]},
-                "ESKI_YARIM": {"buy": sar["YARIM"]["old_buy"], "sell": sar["YARIM"]["old_sell"]},
-                "ESKI_TAM": {"buy": sar["TAM"]["old_buy"], "sell": sar["TAM"]["old_sell"]},
-                "ESKI_GREMSE": {"buy": sar["GREMSE"]["old_buy"], "sell": sar["GREMSE"]["old_sell"]},
-                "ESKI_ATA": {"buy": sar["ATA"]["old_buy"], "sell": sar["ATA"]["old_sell"]},
-                # ons
-                "ONS_ALTIN": {"buy": ons.get("buy"), "sell": ons.get("sell")},
-            },
-        }
-
-        # Save cache
-        _cache["ts"] = now
+        _cache["ts"] = now_ts()
         _cache["data"] = payload
-        _cache["source"] = "OZBAG_HTML"
+        _cache["source"] = "OZBAG"
         _cache["error"] = None
+
+        payload["meta"] = {
+            "source": "OZBAG",
+            "cache_age_sec": 0,
+            "last_error": None,
+            "ozbag_url": OZBAG_SOURCE_URL,
+        }
         return payload
 
     except Exception as e:
-        # Hard fail -> serve last cache if exists
-        err = str(e)
-        _cache["error"] = err
-
+        # If we have old cache -> serve it
+        _cache["error"] = str(e)
         if _cache["data"] is not None:
             payload = dict(_cache["data"])
-            payload["meta"] = dict(payload.get("meta", {}))
-            payload["meta"]["source"] = "CACHE"
-            payload["meta"]["error"] = err
-            payload["meta"]["cache_age_sec"] = int(now - _cache["ts"])
+            payload["meta"] = {
+                "source": "CACHE",
+                "cache_age_sec": int(now_ts() - float(_cache["ts"] or 0)),
+                "last_error": str(e),
+                "ozbag_url": OZBAG_SOURCE_URL,
+            }
             return payload
 
-        # No cache at all
+        # No cache -> return YEDEK
         return {
+            "ok": False,
+            "ts": int(now_ts()),
+            "items": [{"key": k, "name": n, "alis": None, "satis": None} for k, n, _, _ in PRODUCTS],
             "meta": {
-                "app": APP_NAME,
-                "updated_at": datetime.now().strftime("%H:%M:%S"),
-                "date": datetime.now().strftime("%d %B %Y"),
-                "source": "EMPTY",
-                "source_url": None,
-                "cache_ttl_seconds": CACHE_TTL_SECONDS,
+                "source": "YEDEK",
                 "cache_age_sec": None,
-                "error": err,
-            },
-            "products": {},
+                "last_error": str(e),
+                "ozbag_url": OZBAG_SOURCE_URL,
+            }
         }
 
-# =========================
-# Routes
-# =========================
-@app.get("/health")
-def health():
-    return jsonify({
-        "ok": True,
-        "app": APP_NAME,
-        "ozbag_site_url": OZBAG_SITE_URL,
-        "cache_ttl_seconds": CACHE_TTL_SECONDS,
-        "cache_has_data": _cache["data"] is not None,
-        "last_error": _cache["error"],
-    })
+# ------------------------------------------------------------
+# FastAPI app
+# ------------------------------------------------------------
+app = FastAPI(title="Sarıkaya Kuyumculuk TV", version="1.0.0")
+
+# Static folder (put logo.png under ./static/logo.png)
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 @app.get("/api/prices")
 def api_prices():
-    force = request.args.get("force") == "1"
-    payload = get_prices(force=force)
-    return jsonify(payload)
+    return JSONResponse(get_prices(force=True))
 
-@app.get("/")
-def home():
-    return Response(
-        '<meta http-equiv="refresh" content="0; url=/tv">',
-        mimetype="text/html"
-    )
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return tv()
 
-@app.get("/tv")
+@app.get("/tv", response_class=HTMLResponse)
 def tv():
-    # TV UI (polls /api/prices)
-    html = f"""
+    # Simple TV page with animated price updates
+    return HTMLResponse(f"""
 <!doctype html>
 <html lang="tr">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{APP_NAME} • Canlı Fiyat Ekranı</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Sarıkaya Kuyumculuk • Canlı Fiyat Ekranı</title>
   <style>
     :root {{
-      --bg: #0b0b0f;
-      --card: rgba(255,255,255,0.05);
-      --border: rgba(218, 165, 32, 0.35);
+      --bg: #0a0a0d;
+      --card: rgba(18,18,22,.78);
+      --stroke: rgba(212,175,55,.33);
       --gold: #d4af37;
-      --text: rgba(255,255,255,0.92);
-      --muted: rgba(255,255,255,0.55);
-      --good: #2ecc71;
-      --bad: #ff4d4d;
+      --text: #f4f4f6;
+      --muted: rgba(244,244,246,.55);
+      --ok: #2ecc71;
+      --warn: #e74c3c;
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      background: radial-gradient(1200px 800px at 20% 10%, rgba(212,175,55,0.10), transparent 60%),
-                  radial-gradient(1200px 800px at 80% 40%, rgba(212,175,55,0.08), transparent 60%),
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      background: radial-gradient(1200px 600px at 20% 0%, rgba(212,175,55,.08), transparent 60%),
+                  radial-gradient(900px 500px at 100% 10%, rgba(100,100,255,.07), transparent 55%),
                   var(--bg);
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, Arial, sans-serif;
     }}
     .wrap {{
-      max-width: 1200px;
+      padding: 28px 28px 18px;
+      max-width: 1400px;
       margin: 0 auto;
-      padding: 28px 22px 36px;
     }}
     .top {{
-      display: flex;
-      align-items: flex-end;
-      justify-content: space-between;
+      display: grid;
+      grid-template-columns: 1fr auto;
       gap: 16px;
+      align-items: center;
       margin-bottom: 18px;
     }}
     .brand {{
       display: flex;
       align-items: center;
       gap: 14px;
-      min-width: 320px;
+      min-width: 0;
     }}
     .logo {{
-      width: 54px; height: 54px;
+      width: 46px;
+      height: 46px;
       border-radius: 14px;
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.08);
-      display: grid;
-      place-items: center;
-      overflow: hidden;
+      background: rgba(255,255,255,.06);
+      border: 1px solid rgba(255,255,255,.08);
+      display:flex; align-items:center; justify-content:center;
+      overflow:hidden;
     }}
-    .logo img {{
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-    }}
+    .logo img {{ width: 100%; height: 100%; object-fit: cover; }}
     .title {{
-      line-height: 1.05;
+      min-width: 0;
     }}
     .title h1 {{
       margin: 0;
       font-size: 34px;
-      letter-spacing: 1px;
+      letter-spacing: .6px;
       color: var(--gold);
-      font-weight: 800;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }}
     .title .sub {{
-      margin-top: 6px;
-      font-size: 16px;
+      margin-top: 4px;
       color: var(--muted);
+      font-size: 16px;
     }}
     .clock {{
       text-align: right;
-      line-height: 1.05;
     }}
-    .clock .time {{
-      font-size: 64px;
-      font-weight: 800;
+    .clock .t {{
+      font-size: 54px;
+      font-weight: 700;
       letter-spacing: 1px;
     }}
-    .clock .date {{
-      margin-top: 10px;
+    .clock .d {{
       color: var(--muted);
       font-size: 18px;
+      margin-top: 6px;
     }}
 
     .grid {{
       display: grid;
       grid-template-columns: repeat(3, 1fr);
       gap: 18px;
-      margin-top: 18px;
     }}
     .card {{
-      background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
-      border: 1px solid var(--border);
-      border-radius: 22px;
-      padding: 18px 18px 14px;
-      min-height: 160px;
+      background: var(--card);
+      border: 1px solid var(--stroke);
+      border-radius: 26px;
+      padding: 18px 18px 16px;
+      min-height: 190px;
       position: relative;
       overflow: hidden;
     }}
     .card:before {{
-      content: "";
-      position: absolute;
-      inset: -40%;
-      background: radial-gradient(circle at 30% 20%, rgba(212,175,55,0.10), transparent 50%);
-      transform: rotate(10deg);
-      pointer-events: none;
+      content:"";
+      position:absolute; inset:-1px;
+      background: radial-gradient(600px 220px at 30% 0%, rgba(212,175,55,.10), transparent 60%);
+      pointer-events:none;
     }}
-    .label {{
-      font-size: 18px;
-      letter-spacing: 2px;
-      color: rgba(255,255,255,0.70);
-      font-weight: 700;
+    .name {{
       position: relative;
+      font-size: 20px;
+      letter-spacing: 2px;
+      color: rgba(244,244,246,.78);
+      font-weight: 700;
     }}
     .prices {{
+      position: relative;
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 10px;
       margin-top: 14px;
-      position: relative;
     }}
-    .pill {{
-      background: rgba(0,0,0,0.20);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 16px;
-      padding: 10px 12px;
+    .pbox {{
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(0,0,0,.12);
+      padding: 12px 14px;
     }}
-    .pill .k {{
+    .plabel {{
       font-size: 12px;
+      letter-spacing: 2px;
       color: var(--muted);
-      letter-spacing: 1px;
+      margin-bottom: 8px;
     }}
-    .pill .v {{
-      margin-top: 6px;
-      font-size: 34px;
-      font-weight: 900;
-      display: flex;
+    .pval {{
+      font-size: 40px;
+      font-weight: 800;
+      letter-spacing: .5px;
+      display:flex;
       align-items: baseline;
       gap: 8px;
     }}
-    .pill .v .cur {{
+    .cur {{
       color: var(--gold);
-      font-size: 26px;
-      font-weight: 900;
+      font-weight: 800;
+      font-size: 34px;
     }}
-    .updated {{
-      margin-top: 10px;
-      color: rgba(255,255,255,0.45);
-      font-size: 13px;
+    .meta {{
       position: relative;
-    }}
-
-    .footer {{
-      display: flex;
-      justify-content: space-between;
+      display:flex;
       gap: 12px;
-      margin-top: 18px;
+      margin-top: 14px;
       flex-wrap: wrap;
     }}
-    .chip {{
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      padding: 12px 14px;
+    .pill {{
+      padding: 10px 14px;
       border-radius: 999px;
-      border: 1px solid rgba(255,255,255,0.10);
-      background: rgba(255,255,255,0.04);
-      color: rgba(255,255,255,0.75);
+      background: rgba(255,255,255,.06);
+      border: 1px solid rgba(255,255,255,.08);
+      color: rgba(244,244,246,.78);
+      font-size: 14px;
+      display:flex;
+      gap: 10px;
+      align-items:center;
     }}
     .dot {{
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: var(--good);
+      width:10px; height:10px; border-radius:50%;
+      background: var(--ok);
     }}
-    .dot.bad {{
-      background: var(--bad);
+    .dot.warn {{ background: var(--warn); }}
+    .small {{
+      color: var(--muted);
+      font-size: 14px;
+      margin-left: auto;
     }}
 
     /* price animation */
-    .flash-up {{
-      animation: flashUp 0.65s ease-in-out;
-    }}
-    .flash-down {{
-      animation: flashDown 0.65s ease-in-out;
-    }}
+    .flash-up {{ animation: flashUp .65s ease; }}
+    .flash-down {{ animation: flashDown .65s ease; }}
     @keyframes flashUp {{
-      0% {{ transform: scale(1); color: var(--text); }}
-      35% {{ transform: scale(1.03); color: var(--good); }}
-      100% {{ transform: scale(1); color: var(--text); }}
+      0% {{ transform: translateY(0); }}
+      30% {{ transform: translateY(-2px); }}
+      100% {{ transform: translateY(0); }}
     }}
     @keyframes flashDown {{
-      0% {{ transform: scale(1); color: var(--text); }}
-      35% {{ transform: scale(1.03); color: var(--bad); }}
-      100% {{ transform: scale(1); color: var(--text); }}
+      0% {{ transform: translateY(0); }}
+      30% {{ transform: translateY(2px); }}
+      100% {{ transform: translateY(0); }}
     }}
 
-    @media (max-width: 980px) {{
+    @media (max-width: 1100px) {{
+      .grid {{ grid-template-columns: repeat(2, 1fr); }}
+      .clock .t {{ font-size: 44px; }}
+    }}
+    @media (max-width: 720px) {{
       .grid {{ grid-template-columns: 1fr; }}
-      .clock .time {{ font-size: 46px; }}
-      .title h1 {{ font-size: 28px; }}
+      .clock {{ text-align: left; }}
+      .top {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -655,169 +541,157 @@ def tv():
   <div class="wrap">
     <div class="top">
       <div class="brand">
-        <div class="logo" id="logoBox">
-          <img src="{LOGO_URL}" alt="logo" onerror="this.style.display='none'; document.getElementById('logoBox').innerHTML='<div style=\\'font-weight:900;color:#d4af37;\\'>SK</div>';">
+        <div class="logo">
+          <img src="{LOGO_URL}" onerror="this.style.display='none'"/>
         </div>
         <div class="title">
-          <h1>{APP_NAME.upper()}</h1>
+          <h1>SARIKAYA KUYUMCULUK</h1>
           <div class="sub">Canlı Fiyat Ekranı • TV</div>
         </div>
       </div>
-
       <div class="clock">
-        <div class="time" id="time">--:--</div>
-        <div class="date" id="date">--</div>
+        <div class="t" id="clock">--:--</div>
+        <div class="d" id="date">--</div>
       </div>
     </div>
 
     <div class="grid" id="grid"></div>
 
-    <div class="footer">
-      <div class="chip">
-        <span class="dot" id="dot"></span>
-        <span id="statusText">Otomatik güncelleniyor</span>
-      </div>
-      <div class="chip">Kaynak: <b id="source">-</b></div>
-      <div class="chip">Son güncelleme: <b id="last">-</b></div>
-      <div class="chip">Hayırlı işler dileriz</div>
+    <div class="meta">
+      <div class="pill"><span class="dot" id="dot"></span><span id="statusText">Otomatik güncelleniyor</span></div>
+      <div class="pill">Kaynak: <b id="source">-</b></div>
+      <div class="pill">Son güncelleme: <b id="lastUpdate">-</b></div>
+      <div class="pill">Hayırlı işler dileriz</div>
+      <div class="small" id="err"></div>
     </div>
   </div>
 
 <script>
-  const PRODUCTS = [
-    {{ key: "ESKI_CEYREK", title: "ESKİ ÇEYREK" }},
-    {{ key: "ESKI_YARIM",  title: "ESKİ YARIM" }},
-    {{ key: "ESKI_TAM",    title: "ESKİ TAM" }},
-    {{ key: "ESKI_GREMSE", title: "ESKİ GREMSE" }},
-    {{ key: "ESKI_ATA",    title: "ESKİ ATA" }},
-    {{ key: "ONS_ALTIN",   title: "ONS ALTIN" }},
-  ];
-
-  const fmt = (n) => {{
-    if (n === null || n === undefined) return "-";
-    const isInt = Math.abs(n - Math.round(n)) < 1e-9;
-    if (isInt) {{
-      return new Intl.NumberFormat('tr-TR').format(Math.round(n));
-    }}
-    return new Intl.NumberFormat('tr-TR', {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }}).format(n);
+  const fmtTRY = (v) => {{
+    if (v === null || v === undefined) return "--";
+    const n = Math.round(v);
+    return n.toString().replace(/\\B(?=(\\d{{3}})+(?!\\d))/g, ".");
   }};
 
-  function tickClock() {{
+  const state = {{
+    last: {{}},
+    lastTs: 0
+  }};
+
+  function setClock() {{
     const d = new Date();
     const hh = String(d.getHours()).padStart(2,'0');
     const mm = String(d.getMinutes()).padStart(2,'0');
-    document.getElementById('time').textContent = `${{hh}}:${{mm}}`;
-    document.getElementById('date').textContent =
-      d.toLocaleDateString('tr-TR', {{ day:'2-digit', month:'long', year:'numeric', weekday:'long' }});
+    document.getElementById('clock').textContent = `${{hh}}:${{mm}}`;
+    const tr = d.toLocaleDateString('tr-TR', {{ weekday:'long', year:'numeric', month:'long', day:'numeric' }});
+    document.getElementById('date').textContent = tr.charAt(0).toUpperCase() + tr.slice(1);
   }}
-  setInterval(tickClock, 1000);
-  tickClock();
+  setInterval(setClock, 1000);
+  setClock();
 
-  function cardTemplate(p, buy, sell) {{
+  function cardHTML(item) {{
+    const key = item.key;
     return `
-      <div class="card" data-key="${{p.key}}">
-        <div class="label">${{p.title}}</div>
+      <div class="card" data-key="${{key}}">
+        <div class="name">${{item.name}}</div>
         <div class="prices">
-          <div class="pill">
-            <div class="k">ALIŞ</div>
-            <div class="v"><span class="num" data-side="buy">${{fmt(buy)}}</span> <span class="cur">₺</span></div>
+          <div class="pbox">
+            <div class="plabel">ALIŞ</div>
+            <div class="pval" id="alis-${{key}}">-- <span class="cur">₺</span></div>
           </div>
-          <div class="pill">
-            <div class="k">SATIŞ</div>
-            <div class="v"><span class="num" data-side="sell">${{fmt(sell)}}</span> <span class="cur">₺</span></div>
+          <div class="pbox">
+            <div class="plabel">SATIŞ</div>
+            <div class="pval" id="satis-${{key}}">-- <span class="cur">₺</span></div>
           </div>
         </div>
-        <div class="updated">Güncelleme: <span class="u">--</span></div>
       </div>
     `;
   }}
 
-  function buildGrid(initial) {{
+  function renderGrid(items) {{
     const grid = document.getElementById('grid');
-    grid.innerHTML = PRODUCTS.map(p => {{
-      const obj = (initial && initial[p.key]) ? initial[p.key] : {{buy:null, sell:null}};
-      return cardTemplate(p, obj.buy, obj.sell);
-    }}).join('');
+    grid.innerHTML = items.map(cardHTML).join('');
   }}
 
-  function animateIfChanged(el, prev, next) {{
-    if (prev === null || prev === undefined || next === null || next === undefined) return;
-    if (prev === next) return;
-    el.classList.remove('flash-up', 'flash-down');
-    void el.offsetWidth;
-    el.classList.add(next > prev ? 'flash-up' : 'flash-down');
+  function flash(el, dir) {{
+    el.classList.remove('flash-up','flash-down');
+    void el.offsetWidth; // reflow
+    el.classList.add(dir > 0 ? 'flash-up' : 'flash-down');
   }}
 
-  function loadPrev() {{
-    try {{ return JSON.parse(localStorage.getItem("prevPrices") || "{{}}"); }} catch(e) {{ return {{}}; }}
-  }}
-  function savePrev(obj) {{
-    try {{ localStorage.setItem("prevPrices", JSON.stringify(obj)); }} catch(e) {{}}
-  }}
+  function updateValues(items) {{
+    for (const it of items) {{
+      const key = it.key;
+      const aEl = document.getElementById(`alis-${{key}}`);
+      const sEl = document.getElementById(`satis-${{key}}`);
 
-  async function refresh() {{
-    const dot = document.getElementById('dot');
-    const statusText = document.getElementById('statusText');
-    try {{
-      const r = await fetch('/api/prices', {{ cache: 'no-store' }});
-      const data = await r.json();
+      const prev = state.last[key] || {{}};
+      const newA = it.alis;
+      const newS = it.satis;
 
-      const prev = loadPrev();
-      const nextStore = {{}};
-
-      document.getElementById('source').textContent = data.meta.source || "-";
-      document.getElementById('last').textContent = data.meta.updated_at || "-";
-
-      const ok = !data.meta.error;
-      dot.classList.toggle('bad', !ok);
-      statusText.textContent = ok ? "Otomatik güncelleniyor" : ("Uyarı: " + (data.meta.error || "Hata"));
-
-      for (const p of PRODUCTS) {{
-        const card = document.querySelector(`.card[data-key="${{p.key}}"]`);
-        if (!card) continue;
-
-        const obj = (data.products && data.products[p.key]) ? data.products[p.key] : {{buy:null, sell:null}};
-        const buyEl = card.querySelector('.num[data-side="buy"]');
-        const sellEl = card.querySelector('.num[data-side="sell"]');
-        const uEl = card.querySelector('.u');
-
-        const prevBuy = (prev[p.key] && prev[p.key].buy !== undefined) ? prev[p.key].buy : null;
-        const prevSell = (prev[p.key] && prev[p.key].sell !== undefined) ? prev[p.key].sell : null;
-
-        // update text
-        buyEl.textContent = fmt(obj.buy);
-        sellEl.textContent = fmt(obj.sell);
-
-        // animate
-        animateIfChanged(buyEl, prevBuy, obj.buy);
-        animateIfChanged(sellEl, prevSell, obj.sell);
-
-        uEl.textContent = data.meta.updated_at || "--";
-
-        nextStore[p.key] = {{ buy: obj.buy, sell: obj.sell }};
+      if (aEl) {{
+        aEl.firstChild && (aEl.firstChild.textContent = fmtTRY(newA) + " ");
+        if (prev.alis !== undefined && newA !== null && prev.alis !== null && newA !== prev.alis) {{
+          flash(aEl, newA > prev.alis ? 1 : -1);
+        }}
+      }}
+      if (sEl) {{
+        sEl.firstChild && (sEl.firstChild.textContent = fmtTRY(newS) + " ");
+        if (prev.satis !== undefined && newS !== null && prev.satis !== null && newS !== prev.satis) {{
+          flash(sEl, newS > prev.satis ? 1 : -1);
+        }}
       }}
 
-      savePrev(nextStore);
-    }} catch (e) {{
-      dot.classList.add('bad');
-      statusText.textContent = "Bağlantı hatası";
+      state.last[key] = {{ alis: newA, satis: newS }};
     }}
   }}
 
-  buildGrid();
-  refresh();
-  setInterval(refresh, {max(5, CACHE_TTL_SECONDS)} * 1000);
+  async function tick() {{
+    try {{
+      const res = await fetch('/api/prices', {{ cache: 'no-store' }});
+      const data = await res.json();
+
+      if (!document.getElementById('grid').children.length) {{
+        renderGrid(data.items);
+      }}
+
+      updateValues(data.items);
+
+      const meta = data.meta || {{}};
+      document.getElementById('source').textContent = meta.source || '-';
+      document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('tr-TR');
+      document.getElementById('err').textContent = meta.last_error ? ("Hata: " + meta.last_error) : "";
+
+      const dot = document.getElementById('dot');
+      const statusText = document.getElementById('statusText');
+      if (meta.source === "OZBAG") {{
+        dot.classList.remove('warn');
+        statusText.textContent = "Otomatik güncelleniyor";
+      }} else {{
+        dot.classList.add('warn');
+        statusText.textContent = "Cache (geçici) kullanılıyor";
+      }}
+    }} catch (e) {{
+      const dot = document.getElementById('dot');
+      dot.classList.add('warn');
+      document.getElementById('statusText').textContent = "Bağlantı hatası";
+      document.getElementById('err').textContent = "Hata: " + e;
+    }}
+  }}
+
+  tick();
+  setInterval(tick, 5000);
 </script>
 </body>
 </html>
-"""
-    return render_template_string(html)
+    """)
 
-# Serve static folder safely (optional)
-@app.get("/static/<path:filename>")
-def static_files(filename):
-    return send_from_directory(app.static_folder, filename)
-
-if __name__ == "__main__":
-    # Railway will set PORT; bind 0.0.0.0
-    app.run(host="0.0.0.0", port=PORT)
+# Helpful debug endpoint (optional)
+@app.get("/debug", response_class=JSONResponse)
+def debug():
+    return JSONResponse({
+        "OZBAG_SOURCE_URL": OZBAG_SOURCE_URL,
+        "CACHE_TTL_SECONDS": CACHE_TTL_SECONDS,
+        "LOGO_URL": LOGO_URL,
+        "MARGINS": MARGINS,
+    })

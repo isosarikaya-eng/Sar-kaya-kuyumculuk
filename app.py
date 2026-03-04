@@ -90,90 +90,75 @@ def _apply_margin(item_key: str, buy: Optional[float], sell: Optional[float]) ->
 # =========================
 # OZBAG SCRAPE (PLAYWRIGHT)
 # =========================
-async def fetch_ozbag_prices() -> Dict[str, Any]:
-    """
-    ozbag.com ana sayfayı gerçek tarayıcıyla açar,
-    Sarrafiye tablosundan (Eski Alış/Eski Satış) çeker,
-    ayrıca Altın/Ons panelinden ons alış/satış çeker.
-    """
-    ua = (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    )
+async def fetch_ozbag_prices():
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-        ])
-        context = await browser.new_context(
-            user_agent=ua,
-            locale="tr-TR",
-            timezone_id="Europe/Istanbul",
-            extra_http_headers={
-                "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-            }
+
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-        page = await context.new_page()
 
-        # Biraz daha “insan” davranışı
-        await page.goto(OZBAG_SITE_URL, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(1200)
+        page = await browser.new_page()
 
-        # Sarrafiye tablosu bekle (sayfada var)
-        # Sayfa HTML’i değişirse burası güncellenir.
-        await page.wait_for_selector("text=Sarrafiye", timeout=20000)
+        await page.goto("https://www.ozbag.com/", wait_until="networkidle")
 
-        # Tablo metinlerini al
-        html = await page.content()
+        await page.wait_for_selector("table")
 
-        # --- Sarrafiye tablosundan "Eski" fiyatları çek ---
-        # Tablo genelde şu kolonlarla geliyor: Yeni Alış / Yeni Satış / Eski Alış / Eski Satış
-        # Biz "Eski Alış" ve "Eski Satış" istiyoruz.
-        # En sağlam yol: satır bazlı regex.
-        def find_row_prices(row_name: str):
-            # row_name örn "ÇEYREK"
-            # satırda 4 fiyat var, biz 3. ve 4. (eski alış/satış) alacağız
-            # Örnek satır görüntüsü: ÇEYREK ... ₺12,120 ₺12,285 ₺11,955 ₺12,150
-            # Fiyat desenleri: ₺12,150 / ₺12.150 / 5191.36 vs
-            pattern = rf"{re.escape(row_name)}.*?(₺?\s*[\d\.,]+).*?(₺?\s*[\d\.,]+).*?(₺?\s*[\d\.,]+).*?(₺?\s*[\d\.,]+)"
-            m = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
-            if not m:
-                return None, None, None, None
-            p1, p2, p3, p4 = m.group(1), m.group(2), m.group(3), m.group(4)
-            return p1, p2, p3, p4
+        rows = await page.query_selector_all("table tbody tr")
 
-        results: Dict[str, Any] = {}
-        for it in ITEMS:
-            if it["type"] == "sarrafiye_eski":
-                _, _, eski_alis_raw, eski_satis_raw = find_row_prices(it["ozbag_row"])
-                buy = _to_float(eski_alis_raw)
-                sell = _to_float(eski_satis_raw)
-                buy, sell = _apply_margin(it["key"], buy, sell)
-                results[it["key"]] = {"buy": buy, "sell": sell}
+        data = {}
 
-        # --- Ons Altın paneli ---
-        # Sayfada "ALTIN / ONS" kartı var. İçinde iki sayı: Alış / Satış.
-        ons_pattern = r"ALTIN\s*/\s*ONS.*?Alış.*?([\d\.,]+).*?Satış.*?([\d\.,]+)"
-        om = re.search(ons_pattern, html, flags=re.IGNORECASE | re.DOTALL)
-        if om:
-            ons_buy = _to_float(om.group(1))
-            ons_sell = _to_float(om.group(2))
-        else:
-            # alternatif: sadece "ONS" geçen blokları yakala
-            ons_buy = None
-            ons_sell = None
+        for r in rows:
 
-        ons_buy, ons_sell = _apply_margin("ONS_ALTIN", ons_buy, ons_sell)
-        results["ONS_ALTIN"] = {"buy": ons_buy, "sell": ons_sell}
+            cols = await r.query_selector_all("td")
 
-        # timestamp çıkar (sayfada saat var)
-        ts_match = re.search(r"\b(\d{2}:\d{2}:\d{2})\b", html)
-        updated_at = ts_match.group(1) if ts_match else None
+            if len(cols) < 5:
+                continue
 
-        await context.close()
+            name = (await cols[0].inner_text()).strip()
+
+            eski_alis = await cols[3].inner_text()
+            eski_satis = await cols[4].inner_text()
+
+            name = name.upper()
+
+            if "ÇEYREK" in name:
+                data["ESKI_CEYREK"] = {
+                    "buy": _to_float(eski_alis),
+                    "sell": _to_float(eski_satis)
+                }
+
+            if "YARIM" in name:
+                data["ESKI_YARIM"] = {
+                    "buy": _to_float(eski_alis),
+                    "sell": _to_float(eski_satis)
+                }
+
+            if "TAM" in name:
+                data["ESKI_TAM"] = {
+                    "buy": _to_float(eski_alis),
+                    "sell": _to_float(eski_satis)
+                }
+
+            if "GREMSE" in name:
+                data["ESKI_GREMSE"] = {
+                    "buy": _to_float(eski_alis),
+                    "sell": _to_float(eski_satis)
+                }
+
+            if "ATA" in name:
+                data["ESKI_ATA"] = {
+                    "buy": _to_float(eski_alis),
+                    "sell": _to_float(eski_satis)
+                }
+
         await browser.close()
+
+        return {
+            "items": data,
+            "updated_at": time.strftime("%H:%M:%S")
+        }
 
         return {
             "items": results,

@@ -48,6 +48,12 @@ def _fetch_prices():
         return _cache["data"]
 
     data = None
+    if not data:
+    data = {
+        "ceyrek": 12150,
+        "yarim": 24300,
+        "tam": 48600
+    }
 
     # 1) Özbağ API varsa oradan çek
     if OZBAG_API_URL:

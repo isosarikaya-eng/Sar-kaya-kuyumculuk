@@ -1,306 +1,335 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 import os
 import time
+from typing import Any, Dict, Optional, Tuple
+
 import requests
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
-# =========================
-# CONFIG
-# =========================
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "20"))  # TV için 20 sn iyi
-OZBAG_API_URL = os.getenv("OZBAG_API_URL", "").strip()         # örn: https://....../prices
-LOGO_URL = os.getenv("LOGO_URL", "").strip()                   # örn: /static/logo.png veya https://...
+# ======================
+# CONFIG (ENV)
+# ======================
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "30"))  # 30 sn cache
+OZBAG_API_URL = os.getenv("OZBAG_API_URL", "").strip()         # dış kaynak json endpoint
+LOGO_URL = os.getenv("LOGO_URL", "").strip()                   # istersen https://.../logo.png
 
-# Eğer static klasörü yoksa crash olmasın
+# Eğer projede static/ varsa mount et (yoksa crash etmez)
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
-_cache = {"ts": 0.0, "data": None, "ok": False, "error": ""}
+# Basit in-memory cache
+_cache: Dict[str, Any] = {"ts": 0.0, "data": None, "source": "YEDEK", "error": None}
 
-FALLBACK = {
-    "ceyrek": 12150,
-    "yarim": 24300,
-    "tam": 48600,
-}
 
-# =========================
+# ======================
 # HELPERS
-# =========================
-def _now() -> float:
+# ======================
+def _now_ts() -> float:
     return time.time()
 
-def _safe_get_json(url: str, timeout: int = 8):
-    try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "sarıkaya-tv/1.0"})
-        r.raise_for_status()
-        return r.json(), ""
-    except Exception as e:
-        return None, str(e)
 
-def _normalize_prices(data: dict):
+def _safe_get_json(url: str, timeout: int = 8) -> Dict[str, Any]:
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": "sarıkaya-tv/1.0"})
+    r.raise_for_status()
+    # Bazı endpointler text/plain döndürebilir; JSON parse dene
+    return r.json()
+
+
+def _normalize_prices(payload: Dict[str, Any]) -> Tuple[Dict[str, int], str]:
     """
-    Dış API'den gelen farklı key formatlarını normalize eder.
-    Kabul edilen olası keyler:
-      ceyrek / Çeyrek / Ceyrek
-      yarim  / Yarım  / Yarim
-      tam    / Tam
+    Dış kaynak farklı format dönebilir.
+    Beklenen final format:
+      {"ceyrek": 12150, "yarim": 24300, "tam": 48600}
+
+    Kabul edilen input örnekleri:
+      - {"ceyrek":12150,"yarim":24300,"tam":48600}
+      - {"Çeyrek":12150,"Yarım":24300,"Tam":48600}
+      - {"gram_tl": 3450} -> basit çarpanla hesaplar
+      - {"data": {...}} gibi nested
     """
-    if not isinstance(data, dict):
-        return None
+    data = payload
+    if "data" in payload and isinstance(payload["data"], dict):
+        data = payload["data"]
 
-    # key normalize
-    def pick(*keys):
-        for k in keys:
-            if k in data:
-                return data[k]
-        return None
+    # 1) direkt coin fiyatları
+    key_map = {
+        "çeyrek": "ceyrek",
+        "ceyrek": "ceyrek",
+        "yarım": "yarim",
+        "yarim": "yarim",
+        "tam": "tam",
+        "ziynet": "tam",
+    }
 
-    c = pick("ceyrek", "Çeyrek", "Ceyrek", "CEYREK", "çeyrek")
-    y = pick("yarim", "Yarım", "Yarim", "YARIM", "yarım")
-    t = pick("tam", "Tam", "TAM")
+    found: Dict[str, int] = {}
+    for k, v in data.items():
+        if not isinstance(k, str):
+            continue
+        kk = k.strip().lower()
+        if kk in key_map:
+            try:
+                found[key_map[kk]] = int(round(float(v)))
+            except Exception:
+                pass
 
-    # bazen string gelebilir
-    try:
-        c = int(float(c)) if c is not None else None
-        y = int(float(y)) if y is not None else None
-        t = int(float(t)) if t is not None else None
-    except Exception:
-        return None
+    if all(x in found for x in ("ceyrek", "yarim", "tam")):
+        return found, "API"
 
-    if c and y and t:
-        return {"ceyrek": c, "yarim": y, "tam": t}
-    return None
+    # 2) gram üzerinden hesap
+    gram_keys = ["gram", "gram_tl", "gram_altin", "gram_altin_tl"]
+    gram_val: Optional[float] = None
+    for gk in gram_keys:
+        if gk in data:
+            try:
+                gram_val = float(data[gk])
+                break
+            except Exception:
+                pass
 
-def _get_prices():
-    """
-    Cache + dış kaynak + fallback
-    Asla exception fırlatmaz.
-    """
-    age = _now() - _cache["ts"]
-    if _cache["data"] is not None and age < CACHE_TTL_SECONDS:
-        return _cache["data"], _cache["ok"], _cache["error"]
+    if gram_val is not None:
+        # Basit referans: çeyrek ~ 1.75g, yarım ~ 3.50g, tam ~ 7.00g
+        c = int(round(gram_val * 1.75))
+        y = int(round(gram_val * 3.50))
+        t = int(round(gram_val * 7.00))
+        return {"ceyrek": c, "yarim": y, "tam": t}, "API"
 
-    # varsayılan: fallback
-    out = dict(FALLBACK)
-    ok = False
-    err = ""
+    # hiçbiri yoksa hata
+    raise ValueError("Beklenen fiyat alanları bulunamadı.")
+
+
+def _get_prices_cached() -> Dict[str, Any]:
+    # cache taze ise dön
+    if _cache["data"] is not None and (_now_ts() - float(_cache["ts"])) < CACHE_TTL_SECONDS:
+        return _cache
+
+    # Yedek (her zaman çalışır)
+    fallback_prices = {"ceyrek": 12150, "yarim": 24300, "tam": 48600}
+    result = {
+        "ts": _now_ts(),
+        "data": fallback_prices,
+        "source": "YEDEK",
+        "error": None,
+    }
 
     if OZBAG_API_URL:
-        data, err = _safe_get_json(OZBAG_API_URL)
-        norm = _normalize_prices(data) if data else None
-        if norm:
-            out = norm
-            ok = True
-            err = ""
-        else:
-            ok = False
-            err = err or "API yanıtı beklenen formatta değil."
+        try:
+            payload = _safe_get_json(OZBAG_API_URL)
+            normalized, src = _normalize_prices(payload)
+            result["data"] = normalized
+            result["source"] = src
+        except Exception as e:
+            result["error"] = f"API okunamadı: {e}"
 
-    _cache["ts"] = _now()
-    _cache["data"] = out
-    _cache["ok"] = ok
-    _cache["error"] = err
-    return out, ok, err
+    _cache.update(result)
+    return _cache
 
-def _fmt_try(v):
-    try:
-        return f"{int(v):,}".replace(",", ".")
-    except Exception:
-        return "-"
 
-# =========================
+def _logo_src() -> str:
+    # Öncelik: LOGO_URL env → /static/logo.png → boş
+    if LOGO_URL:
+        return LOGO_URL
+    if os.path.isdir("static") and os.path.exists("static/logo.png"):
+        return "/static/logo.png"
+    return ""
+
+
+# ======================
 # ROUTES
-# =========================
-@app.get("/")
+# ======================
+@app.get("/", response_class=JSONResponse)
 def health():
     return {
         "ok": True,
-        "service": "sarikaya-tv",
+        "service": "sarıkaya-tv",
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
-        "ozbag_api_set": bool(OZBAG_API_URL),
-        "logo_set": bool(LOGO_URL),
+        "ozbag_api_url_set": bool(OZBAG_API_URL),
+        "logo_url_set": bool(LOGO_URL),
     }
 
-@app.get("/prices")
-def prices():
-    data, ok, err = _get_prices()
-    # Asla 500 dönmesin
-    return JSONResponse(
-        status_code=200,
-        content={
-            "source_ok": ok,
-            "error": err,
-            "data": data
-        }
-    )
 
-@app.get("/prices.csv", response_class=PlainTextResponse)
-def prices_csv():
-    data, ok, err = _get_prices()
-    # Google Sheets IMPORTDATA için sade CSV
-    # (Sheets hata vermesin diye 200 dönüyoruz)
-    csv = (
-        "kalem,fiyat\n"
-        f"ceyrek,{data.get('ceyrek','')}\n"
-        f"yarim,{data.get('yarim','')}\n"
-        f"tam,{data.get('tam','')}\n"
-    )
-    return csv
+@app.get("/prices", response_class=JSONResponse)
+def prices():
+    c = _get_prices_cached()
+    return {
+        "ceyrek": c["data"]["ceyrek"],
+        "yarim": c["data"]["yarim"],
+        "tam": c["data"]["tam"],
+        "source": c["source"],
+        "last_update_ts": int(c["ts"]),
+        "error": c["error"],
+    }
+
 
 @app.get("/tv", response_class=HTMLResponse)
 def tv():
-    data, ok, err = _get_prices()
-
-    c = _fmt_try(data.get("ceyrek"))
-    y = _fmt_try(data.get("yarim"))
-    t = _fmt_try(data.get("tam"))
-
-    logo_html = ""
-    if LOGO_URL:
-        logo_html = f'<img class="logo" src="{LOGO_URL}" alt="logo" onerror="this.style.display=\'none\'" />'
-
-    status_text = "CANLI" if ok else "YEDEK"
-    status_class = "ok" if ok else "bad"
-    status_detail = "Kaynak: API" if ok else "Kaynak: Yedek (API yok/erişilemiyor)"
-
-    # TV landscape tasarım (16:9)
+    logo = _logo_src()
+    # Yatay / TV moduna uygun, otomatik yenileyen ekran
     html = f"""
 <!doctype html>
 <html lang="tr">
 <head>
   <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
-  <meta http-equiv="refresh" content="{CACHE_TTL_SECONDS}">
-  <title>Sarıkaya Kuyumculuk - TV</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Sarıkaya Kuyumculuk • Canlı Fiyat</title>
   <style>
     :root {{
-      --bg1:#07070a; --bg2:#0e0f16;
-      --gold:#d7b46a; --gold2:#b9923b;
-      --card: rgba(255,255,255,.06);
-      --stroke: rgba(215,180,106,.25);
-      --text:#ffffff;
+      --bg1: #0b0c10;
+      --bg2: #15161b;
+      --gold: #d6b15d;
       --muted: rgba(255,255,255,.65);
-      --ok:#2dd36f;
-      --bad:#ff453a;
+      --card: rgba(255,255,255,.06);
+      --stroke: rgba(214,177,93,.25);
+      --ok: #35d07f;
+      --bad: #ff4d4d;
     }}
     *{{box-sizing:border-box}}
     body {{
-      margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial;
-      color:var(--text);
-      background: radial-gradient(1200px 600px at 20% 10%, rgba(215,180,106,.18), transparent 60%),
-                  radial-gradient(900px 500px at 80% 20%, rgba(215,180,106,.10), transparent 55%),
-                  linear-gradient(120deg, var(--bg1), var(--bg2));
-      height:100vh; overflow:hidden;
+      margin:0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      color: #fff;
+      background: radial-gradient(1200px 600px at 20% 0%, rgba(214,177,93,.12), transparent 60%),
+                  radial-gradient(900px 500px at 80% 20%, rgba(255,255,255,.06), transparent 55%),
+                  linear-gradient(180deg, var(--bg2), var(--bg1));
+      height: 100vh;
+      overflow:hidden;
     }}
     .wrap {{
-      height:100vh; padding:34px 46px;
-      display:flex; flex-direction:column; gap:22px;
+      height:100vh;
+      padding: 42px 56px;
+      display:flex;
+      flex-direction:column;
+      gap: 26px;
     }}
     .top {{
-      display:flex; align-items:center; justify-content:space-between;
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap: 24px;
     }}
     .brand {{
-      display:flex; align-items:center; gap:18px;
+      display:flex;
+      gap: 18px;
+      align-items:flex-start;
     }}
     .logo {{
-      width:64px; height:64px; border-radius:16px;
-      background:rgba(255,255,255,.04);
-      border:1px solid var(--stroke);
-      padding:10px; object-fit:contain;
+      width: 70px;
+      height: 70px;
+      border-radius: 16px;
+      background: rgba(255,255,255,.06);
+      border: 1px solid rgba(255,255,255,.10);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      overflow:hidden;
     }}
-    .title {{
-      display:flex; flex-direction:column; gap:6px;
+    .logo img {{
+      width:100%;
+      height:100%;
+      object-fit:cover;
     }}
-    .title h1 {{
-      margin:0; font-size:40px; letter-spacing:1px;
-      color:var(--gold);
-      text-transform:uppercase;
+    .brand h1 {{
+      margin:0;
+      font-size: 42px;
+      letter-spacing: 2px;
+      color: var(--gold);
     }}
-    .title .sub {{
-      color:var(--muted); font-size:18px;
+    .brand .sub {{
+      margin-top: 6px;
+      font-size: 18px;
+      color: var(--muted);
     }}
-    .clock {{
+    .time {{
       text-align:right;
     }}
-    .clock .time {{
-      font-size:42px; font-weight:700;
+    .clock {{
+      font-size: 56px;
+      font-weight: 700;
+      letter-spacing: 2px;
     }}
-    .clock .date {{
-      color:var(--muted); font-size:18px;
-      margin-top:6px;
+    .date {{
+      margin-top: 6px;
+      font-size: 20px;
+      color: var(--muted);
+      line-height: 1.2;
     }}
-    .grid {{
+    .cards {{
       flex:1;
       display:grid;
       grid-template-columns: repeat(3, 1fr);
-      gap:22px;
+      gap: 22px;
       align-items:stretch;
     }}
     .card {{
-      background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.04));
-      border:1px solid var(--stroke);
-      border-radius:28px;
-      padding:26px 30px;
-      position:relative;
-      overflow:hidden;
+      border-radius: 36px;
+      background: linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.03));
+      border: 1px solid var(--stroke);
+      box-shadow: 0 20px 60px rgba(0,0,0,.35);
+      padding: 34px 34px 28px 34px;
+      display:flex;
+      flex-direction:column;
+      justify-content:space-between;
+      min-height: 420px;
     }}
-    .card:before {{
-      content:"";
-      position:absolute; inset:-40%;
-      background: radial-gradient(circle at 30% 20%, rgba(215,180,106,.18), transparent 55%);
-      transform:rotate(10deg);
-    }}
-    .card * {{ position:relative; }}
     .label {{
-      font-size:28px; letter-spacing:2px;
-      color:rgba(255,255,255,.8);
-      text-transform:uppercase;
+      font-size: 26px;
+      letter-spacing: 2px;
+      color: rgba(255,255,255,.75);
+      font-weight: 700;
     }}
     .price {{
-      margin-top:18px;
-      display:flex; align-items:baseline; gap:14px;
-      font-size:92px; font-weight:800;
+      font-size: 92px;
+      font-weight: 800;
+      letter-spacing: 1px;
+      display:flex;
+      align-items:baseline;
+      gap: 14px;
+      margin-top: 24px;
     }}
-    .cur {{
-      font-size:54px;
-      color:var(--gold);
-      font-weight:800;
+    .tl {{
+      font-size: 64px;
+      color: var(--gold);
+      font-weight: 800;
     }}
-    .foot {{
-      display:flex; align-items:center; justify-content:space-between;
-      gap:18px;
-      margin-top:4px;
+    .footer {{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap: 18px;
+      padding-top: 8px;
+      color: var(--muted);
+      font-size: 18px;
     }}
     .pill {{
-      display:inline-flex; align-items:center; gap:10px;
-      padding:10px 14px;
-      border-radius:999px;
-      border:1px solid var(--stroke);
-      background:rgba(0,0,0,.25);
-      color:var(--muted);
-      font-size:14px;
-      white-space:nowrap;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,.10);
+      padding: 12px 16px;
+      background: rgba(0,0,0,.22);
+      display:flex;
+      align-items:center;
+      gap: 10px;
     }}
     .dot {{
-      width:10px; height:10px; border-radius:50%;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--bad);
+      box-shadow: 0 0 18px rgba(255,77,77,.35);
+    }}
+    .dot.ok {{
       background: var(--ok);
+      box-shadow: 0 0 18px rgba(53,208,127,.35);
     }}
-    .dot.bad {{ background: var(--bad); }}
-    .status {{
-      font-weight:700;
-      color:#fff;
-    }}
-    .status.ok {{ color: var(--ok); }}
-    .status.bad {{ color: var(--bad); }}
-    .error {{
-      max-width:46vw;
-      overflow:hidden;
-      text-overflow:ellipsis;
-      white-space:nowrap;
-      color:rgba(255,255,255,.45);
+    @media (max-width: 1100px) {{
+      .wrap{{padding: 28px 22px}}
+      .brand h1{{font-size: 30px}}
+      .clock{{font-size: 44px}}
+      .cards{{grid-template-columns: 1fr;}}
+      .price{{font-size: 76px}}
+      .tl{{font-size: 52px}}
+      .card{{min-height: 240px}}
     }}
   </style>
 </head>
@@ -308,69 +337,100 @@ def tv():
   <div class="wrap">
     <div class="top">
       <div class="brand">
-        {logo_html}
-        <div class="title">
+        <div class="logo">
+          {f'<img src="{logo}" alt="logo"/>' if logo else '<span style="color:rgba(255,255,255,.35);font-weight:700">SK</span>'}
+        </div>
+        <div>
           <h1>SARIKAYA KUYUMCULUK</h1>
           <div class="sub">Canlı Fiyat Ekranı</div>
         </div>
       </div>
-      <div class="clock">
-        <div class="time" id="clock">--:--</div>
+      <div class="time">
+        <div class="clock" id="clock">--:--</div>
         <div class="date" id="date">--</div>
       </div>
     </div>
 
-    <div class="grid">
+    <div class="cards">
       <div class="card">
         <div class="label">ÇEYREK</div>
-        <div class="price"><span>{c}</span><span class="cur">₺</span></div>
+        <div class="price"><span id="ceyrek">—</span><span class="tl">₺</span></div>
       </div>
       <div class="card">
         <div class="label">YARIM</div>
-        <div class="price"><span>{y}</span><span class="cur">₺</span></div>
+        <div class="price"><span id="yarim">—</span><span class="tl">₺</span></div>
       </div>
       <div class="card">
         <div class="label">TAM</div>
-        <div class="price"><span>{t}</span><span class="cur">₺</span></div>
+        <div class="price"><span id="tam">—</span><span class="tl">₺</span></div>
       </div>
     </div>
 
-    <div class="foot">
+    <div class="footer">
       <div class="pill">
-        <span class="dot {'bad' if not ok else ''}"></span>
-        <span class="status {status_class}">{status_text}</span>
+        <span class="dot" id="dot"></span>
+        <span id="status">YEDEK</span>
         <span>•</span>
-        <span>{status_detail}</span>
+        <span id="src">Kaynak: -</span>
       </div>
       <div class="pill">
-        <span>Otomatik yenileme:</span>
-        <b>{CACHE_TTL_SECONDS}s</b>
-      </div>
-      <div class="pill error" title="{err}">
-        {("Bağlantı sorunu: " + err) if (not ok and err) else "Hayırlı işler dileriz."}
+        <span id="updated">Son güncelleme: -</span>
+        <span>•</span>
+        <span>Hayırlı işler dileriz</span>
       </div>
     </div>
   </div>
 
 <script>
-  function pad(n){{return String(n).padStart(2,'0');}}
-  const days = ["Pazar","Pazartesi","Salı","Çarşamba","Perşembe","Cuma","Cumartesi"];
-  const months = ["Ocak","Şubat","Mart","Nisan","Mayıs","Haziran","Temmuz","Ağustos","Eylül","Ekim","Kasım","Aralık"];
-  function tick(){{
-    const d = new Date();
-    document.getElementById("clock").textContent = pad(d.getHours()) + ":" + pad(d.getMinutes());
-    document.getElementById("date").textContent =
-      d.getDate() + " " + months[d.getMonth()] + " " + d.getFullYear() + " • " + days[d.getDay()];
+  function pad(n){{ return String(n).padStart(2,'0'); }}
+  function fmt(n){{
+    try {{
+      return Number(n).toLocaleString('tr-TR');
+    }} catch(e) {{
+      return String(n);
+    }}
   }}
-  tick(); setInterval(tick, 1000);
+
+  function tickClock(){{
+    const d = new Date();
+    document.getElementById('clock').textContent = pad(d.getHours()) + ":" + pad(d.getMinutes());
+    const opts = {{ weekday:'long', year:'numeric', month:'long', day:'numeric' }};
+    document.getElementById('date').textContent = d.toLocaleDateString('tr-TR', opts);
+  }}
+  setInterval(tickClock, 1000);
+  tickClock();
+
+  async function refreshPrices(){{
+    try {{
+      const r = await fetch('/prices?ts=' + Date.now(), {{ cache: 'no-store' }});
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      const j = await r.json();
+
+      document.getElementById('ceyrek').textContent = fmt(j.ceyrek);
+      document.getElementById('yarim').textContent  = fmt(j.yarim);
+      document.getElementById('tam').textContent    = fmt(j.tam);
+
+      const ok = (j.source && j.source !== 'YEDEK' && !j.error);
+      const dot = document.getElementById('dot');
+      dot.classList.toggle('ok', ok);
+
+      document.getElementById('status').textContent = ok ? 'OTOMATİK' : 'YEDEK';
+      document.getElementById('src').textContent = 'Kaynak: ' + (ok ? 'Özbağ / API' : ('Yedek (API yok/erişilemiyor)'));
+      const when = j.last_update_ts ? new Date(j.last_update_ts * 1000) : new Date();
+      document.getElementById('updated').textContent = 'Son güncelleme: ' + when.toLocaleTimeString('tr-TR');
+
+    }} catch (e) {{
+      // Ekran boş kalmasın, en azından status güncellensin
+      document.getElementById('dot').classList.remove('ok');
+      document.getElementById('status').textContent = 'YEDEK';
+      document.getElementById('src').textContent = 'Kaynak: Yedek (hata)';
+    }}
+  }}
+
+  refreshPrices();
+  setInterval(refreshPrices, 10000); // 10 sn
 </script>
 </body>
 </html>
 """
-    return HTMLResponse(content=html)
-
-# Eski endpoint ile uyum (istersen kullan)
-@app.get("/ozbag")
-def ozbag_passthrough():
-    data, ok, err = _get_prices()
-    return {"ok": ok, "error": err, "data": data}
+    return HTMLResponse(html)

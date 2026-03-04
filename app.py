@@ -20,9 +20,12 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 _cache = {"ts": 0, "data": None}
 
 def _safe_get_json(url: str, timeout: int = 10):
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
 
 def _compute_from_gram(gram_tl: float):
     """

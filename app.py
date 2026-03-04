@@ -1,3 +1,4 @@
+# version 2
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 

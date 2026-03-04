@@ -13,7 +13,6 @@ OZBAG_API_URL = os.getenv("OZBAG_API_URL", "").strip()         # örn: https://.
 LOGO_URL = os.getenv("LOGO_URL", "").strip()                   # boşsa /static/logo.png kullanır
 
 # STATIC (logo buradan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 _cache = {"ts": 0, "data": None}
 

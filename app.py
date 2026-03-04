@@ -1,412 +1,517 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 import os
 import time
-import threading
+import logging
+from typing import Any, Dict, Optional, Tuple
+
 import requests
-from datetime import datetime
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
-app = FastAPI()
+# ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("sarıkaya-tv")
 
-# =========================
-# Ayarlar (ENV)
-# =========================
+# ----------------------------
+# Config (ENV)
+# ----------------------------
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "30"))
-OZBAG_API_URL = os.getenv("OZBAG_API_URL", "").strip()   # Özbağ GERÇEK API URL'si olmalı
-LOGO_URL = os.getenv("LOGO_URL", "").strip()             # https://.../logo.png veya /static/logo.png
+OZBAG_API_URL = os.getenv("OZBAG_API_URL", "").strip()
+LOGO_URL = os.getenv("LOGO_URL", "/static/logo.png").strip()  # can be /static/logo.png or full https URL
 
-# Eğer repo'da static klasörü varsa mount et (yoksa ASLA crash olmaz)
-if os.path.isdir("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "6.0"))  # seconds
+REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "10"))     # TV refresh interval
 
-# =========================
-# Dahili cache + kilit
-# =========================
-_lock = threading.Lock()
-_cache = {
+# ----------------------------
+# FastAPI
+# ----------------------------
+app = FastAPI(title="Sarıkaya Kuyumculuk TV", version="2.0.0")
+
+# ----------------------------
+# Static (NEVER CRASH if missing)
+# ----------------------------
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    log.info("Static mounted: %s", STATIC_DIR)
+else:
+    # Older crash cause: Directory 'static' does not exist
+    log.warning("Static dir missing, skipping mount: %s", STATIC_DIR)
+
+# ----------------------------
+# In-memory cache
+# ----------------------------
+_cache: Dict[str, Any] = {
     "ts": 0.0,
-    "data": None,          # {"ceyrek":..., "yarim":..., "tam":...}
-    "source": "YEDEK",     # API / CACHE / YEDEK
+    "data": None,
+    "source": "YEDEK",
+    "last_ok": None,  # last successful API fetch time
     "last_error": None,
 }
 
-# Yedek fiyatlar (en kötü senaryoda bile ekranda boş kalmasın)
-FALLBACK_PRICES = {"ceyrek": 12150, "yarim": 24300, "tam": 48600}
+# ----------------------------
+# Backup prices (used when API fails)
+# ----------------------------
+BACKUP_PRICES = {
+    "ceyrek": 12150,
+    "yarim": 24300,
+    "tam": 48600,
+}
 
+# ----------------------------
+# Helpers
+# ----------------------------
+def _now_ts() -> float:
+    return time.time()
 
-def _now_tr():
-    # Türkiye saati +0300 için basit format (Railway container UTC olabilir)
-    # İstersen TZ env ile netleştiririz; şimdilik frontend kendi saatini gösteriyor.
-    return datetime.now().strftime("%H:%M:%S")
+def _is_cache_valid() -> bool:
+    if _cache["data"] is None:
+        return False
+    return (_now_ts() - float(_cache["ts"])) < CACHE_TTL_SECONDS
 
-
-def _fmt_try(n: int) -> str:
-    # 48600 -> 48.600
-    s = f"{int(n):,}".replace(",", ".")
+def _thousands_tr(n: int) -> str:
+    # 12150 -> 12.150
+    s = f"{n:,}".replace(",", ".")
     return s
 
+def _self_url_from_request(request: Request) -> str:
+    # e.g. https://web-production-xxx.up.railway.app
+    return str(request.base_url).rstrip("/")
 
-def _safe_get_json(url: str, timeout: int = 8):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "SarıkayaTV/1.0"})
-    r.raise_for_status()
-    return r.json()
-
-
-def _normalize_prices(payload) -> dict | None:
-    """
-    Özbağ'dan dönen JSON formatı farklı olabilir.
-    Biz şunları kabul ediyoruz:
-    1) {"ceyrek":12150,"yarim":24300,"tam":48600}
-    2) {"data":{"ceyrek":...}} gibi nested
-    3) Büyük/küçük harf farkları
-    """
-    if payload is None:
-        return None
-
-    # nested "data" varsa içeri gir
-    if isinstance(payload, dict) and "data" in payload and isinstance(payload["data"], dict):
-        payload = payload["data"]
-
-    if not isinstance(payload, dict):
-        return None
-
-    # anahtarları normalize et
-    def pick(*keys):
-        for k in keys:
-            if k in payload:
-                return payload[k]
-        return None
-
-    c = pick("ceyrek", "Çeyrek", "CEYREK", "quarter")
-    y = pick("yarim", "Yarım", "YARIM", "half")
-    t = pick("tam", "Tam", "TAM", "full")
-
-    try:
-        if c is None or y is None or t is None:
-            return None
-        return {"ceyrek": int(float(c)), "yarim": int(float(y)), "tam": int(float(t))}
-    except Exception:
-        return None
-
-
-def _is_self_url(url: str) -> bool:
-    # OZBAG_API_URL yanlışlıkla kendi domainine verilmişse döngüyü kır
-    base = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
-    # Railway bazen bunu vermez; yine de heuristik:
-    # url içinde "railway.app" + bizim own path "/ozbag" ise riskli.
+def _looks_self_referential(url: str, request: Request) -> bool:
+    # Prevent setting OZBAG_API_URL to our own /ozbag or /prices which can loop or fail
     if not url:
         return False
-    if "/ozbag" in url and "railway.app" in url:
-        # self olma ihtimali yüksek; %100 değil ama seni korur.
-        return True
-    # Ek kontrol: HOST header ile karşılaştırma yapamıyoruz burada.
-    return False
+    base = _self_url_from_request(request)
+    return url.startswith(base)
 
-
-def _fetch_prices_from_api() -> tuple[dict | None, str | None]:
-    """
-    Başarılıysa (prices, None), değilse (None, error_text)
-    """
-    if not OZBAG_API_URL:
-        return None, "OZBAG_API_URL tanımlı değil"
-
-    if _is_self_url(OZBAG_API_URL):
-        return None, "OZBAG_API_URL kendi uygulamana verilmiş (döngü riski). Gerçek Özbağ API URL girilmeli."
-
+def _safe_get_json(url: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
-        payload = _safe_get_json(OZBAG_API_URL, timeout=8)
-        prices = _normalize_prices(payload)
-        if not prices:
-            return None, f"API JSON formatı beklenen değil: {str(payload)[:120]}"
-        return prices, None
+        r = requests.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return r.json(), None
     except Exception as e:
-        return None, f"API hata: {type(e).__name__}: {e}"
+        return None, str(e)
 
-
-def get_prices(force_refresh: bool = False) -> dict:
+def _extract_prices_from_payload(payload: Dict[str, Any]) -> Optional[Dict[str, int]]:
     """
-    Dışarıya tek tip döner.
+    Tries to understand different possible API schemas.
+    Accepts either:
+      - direct: {"ceyrek": 12345, "yarim": 24690, "tam": 49380}
+      - nested: {"data": {...}}
+      - gram-based: {"gram_tl": 3500} etc -> we compute coins
     """
-    now = time.time()
-    with _lock:
-        age = now - _cache["ts"]
-        if (not force_refresh) and _cache["data"] and age < CACHE_TTL_SECONDS:
-            return {
-                "ok": True,
-                "source": "CACHE",
-                "age_seconds": int(age),
-                "prices": _cache["data"],
-                "updated_at": _cache["ts"],
-                "last_error": _cache["last_error"],
-            }
+    def _dig(d: Dict[str, Any], keys) -> Any:
+        cur = d
+        for k in keys:
+            if not isinstance(cur, dict) or k not in cur:
+                return None
+            cur = cur[k]
+        return cur
 
-    prices, err = _fetch_prices_from_api()
-    with _lock:
-        if prices:
-            _cache["ts"] = now
-            _cache["data"] = prices
-            _cache["source"] = "API"
-            _cache["last_error"] = None
-            return {
-                "ok": True,
-                "source": "API",
-                "age_seconds": 0,
-                "prices": prices,
-                "updated_at": now,
-                "last_error": None,
-            }
+    # 1) try direct coin prices
+    candidates = [
+        payload,
+        payload.get("data") if isinstance(payload.get("data"), dict) else None,
+        payload.get("result") if isinstance(payload.get("result"), dict) else None,
+    ]
+    candidates = [c for c in candidates if isinstance(c, dict)]
 
-        # API yoksa yedeğe düş (cache varsa onu göster)
-        if _cache["data"]:
-            # Cache var ama API çöktü
-            _cache["last_error"] = err
-            return {
-                "ok": True,
-                "source": "CACHE",
-                "age_seconds": int(now - _cache["ts"]),
-                "prices": _cache["data"],
-                "updated_at": _cache["ts"],
-                "last_error": err,
-            }
+    for c in candidates:
+        # common key variants
+        ceyrek = c.get("ceyrek") or c.get("quarter") or c.get("ceyrek_tl")
+        yarim  = c.get("yarim")  or c.get("half")    or c.get("yarim_tl")
+        tam    = c.get("tam")    or c.get("full")    or c.get("tam_tl")
 
-        # Hiç veri yoksa fallback
-        _cache["ts"] = now
-        _cache["data"] = FALLBACK_PRICES
-        _cache["source"] = "YEDEK"
-        _cache["last_error"] = err
+        if all(isinstance(x, (int, float, str)) for x in [ceyrek, yarim, tam]):
+            try:
+                return {
+                    "ceyrek": int(float(ceyrek)),
+                    "yarim": int(float(yarim)),
+                    "tam": int(float(tam)),
+                }
+            except Exception:
+                pass
+
+    # 2) try gram gold -> compute
+    gram_keys = [
+        ("gram_tl",),
+        ("gram",),
+        ("gram_altin",),
+        ("data", "gram_tl"),
+        ("data", "gram"),
+    ]
+    gram_val = None
+    for keys in gram_keys:
+        v = _dig(payload, keys) if len(keys) > 1 else payload.get(keys[0])
+        if isinstance(v, (int, float, str)):
+            try:
+                gram_val = float(v)
+                break
+            except Exception:
+                pass
+
+    if gram_val is not None and gram_val > 0:
+        # Basit hesap (senin eski mantık): Çeyrek=gram*1.75, Yarım=gram*3.5, Tam=gram*7
         return {
-            "ok": False,
-            "source": "YEDEK",
-            "age_seconds": 0,
-            "prices": FALLBACK_PRICES,
-            "updated_at": now,
-            "last_error": err,
+            "ceyrek": int(round(gram_val * 1.75)),
+            "yarim": int(round(gram_val * 3.50)),
+            "tam": int(round(gram_val * 7.00)),
         }
 
+    return None
 
-# =========================
-# Routes
-# =========================
-@app.get("/health")
-def health():
-    # hızlı teşhis için
+def _get_prices(request: Request) -> Dict[str, Any]:
+    """
+    Returns dict:
+    {
+      prices: {ceyrek:int, yarim:int, tam:int},
+      source: "API" | "CACHE" | "YEDEK",
+      last_update_ts: float,
+      last_ok_ts: float|None,
+      error: str|None
+    }
+    """
+    # Cache valid
+    if _is_cache_valid():
+        return {
+            "prices": _cache["data"],
+            "source": "CACHE",
+            "last_update_ts": _cache["ts"],
+            "last_ok_ts": _cache["last_ok"],
+            "error": None,
+        }
+
+    # If URL missing or self-referential -> fallback
+    if not OZBAG_API_URL:
+        _cache["data"] = BACKUP_PRICES
+        _cache["source"] = "YEDEK"
+        _cache["ts"] = _now_ts()
+        _cache["last_error"] = "OZBAG_API_URL not set"
+        return {
+            "prices": BACKUP_PRICES,
+            "source": "YEDEK",
+            "last_update_ts": _cache["ts"],
+            "last_ok_ts": _cache["last_ok"],
+            "error": _cache["last_error"],
+        }
+
+    if _looks_self_referential(OZBAG_API_URL, request):
+        # This is the common mistake: setting OZBAG_API_URL to this app's URL (loop)
+        _cache["data"] = BACKUP_PRICES
+        _cache["source"] = "YEDEK"
+        _cache["ts"] = _now_ts()
+        _cache["last_error"] = "OZBAG_API_URL points to this app (self-referential). Use real Ozbag endpoint."
+        log.error(_cache["last_error"])
+        return {
+            "prices": BACKUP_PRICES,
+            "source": "YEDEK",
+            "last_update_ts": _cache["ts"],
+            "last_ok_ts": _cache["last_ok"],
+            "error": _cache["last_error"],
+        }
+
+    payload, err = _safe_get_json(OZBAG_API_URL)
+    if payload is None:
+        _cache["data"] = BACKUP_PRICES
+        _cache["source"] = "YEDEK"
+        _cache["ts"] = _now_ts()
+        _cache["last_error"] = f"API fetch failed: {err}"
+        log.warning(_cache["last_error"])
+        return {
+            "prices": BACKUP_PRICES,
+            "source": "YEDEK",
+            "last_update_ts": _cache["ts"],
+            "last_ok_ts": _cache["last_ok"],
+            "error": _cache["last_error"],
+        }
+
+    prices = _extract_prices_from_payload(payload)
+    if prices is None:
+        _cache["data"] = BACKUP_PRICES
+        _cache["source"] = "YEDEK"
+        _cache["ts"] = _now_ts()
+        _cache["last_error"] = "API payload recognized but schema not understood"
+        log.warning(_cache["last_error"])
+        return {
+            "prices": BACKUP_PRICES,
+            "source": "YEDEK",
+            "last_update_ts": _cache["ts"],
+            "last_ok_ts": _cache["last_ok"],
+            "error": _cache["last_error"],
+        }
+
+    # OK
+    _cache["data"] = prices
+    _cache["source"] = "API"
+    _cache["ts"] = _now_ts()
+    _cache["last_ok"] = _cache["ts"]
+    _cache["last_error"] = None
+    log.info("API OK: %s", prices)
+
     return {
-        "status": "ok",
-        "cache_ttl_seconds": CACHE_TTL_SECONDS,
-        "ozbag_api_url_set": bool(OZBAG_API_URL),
-        "logo_url": LOGO_URL or None,
-        "static_dir_exists": os.path.isdir("static"),
+        "prices": prices,
+        "source": "API",
+        "last_update_ts": _cache["ts"],
+        "last_ok_ts": _cache["last_ok"],
+        "error": None,
     }
 
+# ----------------------------
+# Routes
+# ----------------------------
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/tv")
 
-@app.get("/prices")
-def prices():
-    data = get_prices(force_refresh=False)
-    # 500 yerine her zaman JSON dönelim
-    return JSONResponse(data)
+@app.get("/health", response_class=JSONResponse)
+def health():
+    return {
+        "status": "ok",
+        "version": app.version,
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+        "ozbag_api_url_set": bool(OZBAG_API_URL),
+        "static_dir_exists": os.path.isdir(STATIC_DIR),
+    }
 
+@app.get("/prices", response_class=JSONResponse)
+def prices(request: Request):
+    data = _get_prices(request)
+    return data
 
-@app.get("/refresh")
-def refresh():
-    data = get_prices(force_refresh=True)
-    return JSONResponse(data)
+@app.get("/ozbag", response_class=JSONResponse)
+def ozbag_proxy(request: Request):
+    """
+    Optional: This endpoint returns the RAW Ozbag payload (for debugging).
+    If OZBAG_API_URL is not set or invalid, returns error.
+    """
+    if not OZBAG_API_URL:
+        return JSONResponse({"ok": False, "error": "OZBAG_API_URL not set"}, status_code=400)
 
+    if _looks_self_referential(OZBAG_API_URL, request):
+        return JSONResponse(
+            {"ok": False, "error": "OZBAG_API_URL points to this app. Use real Ozbag endpoint."},
+            status_code=400,
+        )
+
+    payload, err = _safe_get_json(OZBAG_API_URL)
+    if payload is None:
+        return JSONResponse({"ok": False, "error": f"fetch failed: {err}"}, status_code=502)
+    return {"ok": True, "payload": payload}
 
 @app.get("/tv", response_class=HTMLResponse)
-def tv():
-    # LOGO: boşsa basit "SK" rozet göster
-    logo_html = ""
-    if LOGO_URL:
-        logo_html = f'<img class="logo" src="{LOGO_URL}" alt="logo" onerror="this.style.display=\'none\';document.getElementById(\'logoFallback\').style.display=\'flex\';">'
-    logo_fallback = '<div id="logoFallback" class="logoFallback">SK</div>'
+def tv(request: Request):
+    # Server-side initial load
+    data = _get_prices(request)
+    p = data["prices"]
 
+    # LOGO_URL can be /static/logo.png OR full http(s)
+    logo_src = LOGO_URL or "/static/logo.png"
+
+    # Build HTML (no template engine needed)
     html = f"""
 <!doctype html>
 <html lang="tr">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sarıkaya Kuyumculuk - TV</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sarıkaya Kuyumculuk • TV</title>
   <style>
     :root {{
-      --bg: #0b0b0f;
+      --bg1: #0b0c10;
+      --bg2: #12131a;
+      --gold: #c9a24a;
       --card: rgba(255,255,255,0.06);
-      --stroke: rgba(212,175,55,0.35);
-      --gold: #d4af37;
-      --text: #f3f4f6;
-      --muted: rgba(243,244,246,0.65);
-      --danger: #ff3b30;
-      --ok: #34c759;
+      --card2: rgba(255,255,255,0.03);
+      --line: rgba(201,162,74,0.35);
+      --text: rgba(255,255,255,0.92);
+      --muted: rgba(255,255,255,0.65);
     }}
-    html, body {{ height: 100%; }}
+    * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      background: radial-gradient(1200px 600px at 20% 10%, rgba(212,175,55,0.12), transparent 60%),
-                  radial-gradient(900px 500px at 80% 30%, rgba(255,255,255,0.06), transparent 55%),
-                  var(--bg);
+      font-family: -apple-system, system-ui, Segoe UI, Roboto, Arial, sans-serif;
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      background: radial-gradient(1200px 600px at 20% 0%, rgba(201,162,74,0.18), transparent 55%),
+                  radial-gradient(900px 500px at 90% 20%, rgba(201,162,74,0.10), transparent 60%),
+                  linear-gradient(180deg, var(--bg1), var(--bg2));
+      height: 100vh;
+      overflow: hidden;
     }}
     .wrap {{
-      height: 100%;
-      display: flex;
-      flex-direction: column;
-      padding: 28px 34px;
-      box-sizing: border-box;
+      height: 100vh;
+      padding: 28px 36px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
       gap: 18px;
     }}
     .top {{
       display: grid;
-      grid-template-columns: 96px 1fr 320px;
+      grid-template-columns: 1fr auto;
+      align-items: start;
       gap: 18px;
-      align-items: center;
     }}
-    .logoBox {{
-      width: 86px; height: 86px;
-      border-radius: 18px;
-      background: rgba(255,255,255,0.05);
+    .brand {{
+      display:flex;
+      align-items:center;
+      gap: 14px;
+    }}
+    .logo {{
+      width: 54px;
+      height: 54px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.06);
       border: 1px solid rgba(255,255,255,0.10);
-      display: flex; align-items: center; justify-content: center;
-      overflow: hidden;
-      position: relative;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      overflow:hidden;
     }}
-    .logo {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
-    .logoFallback {{
-      width: 100%; height: 100%;
-      display: none;
-      align-items: center; justify-content: center;
-      font-weight: 800;
-      color: var(--gold);
-      letter-spacing: 1px;
+    .logo img {{
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
     }}
-    .brand h1 {{
+    .title {{
+      line-height: 1.05;
+    }}
+    .title h1 {{
       margin: 0;
-      font-size: 44px;
-      letter-spacing: 1px;
-      color: var(--gold);
       font-weight: 800;
+      letter-spacing: 0.5px;
+      color: var(--gold);
+      font-size: 44px;
     }}
-    .brand .sub {{
+    .title .sub {{
       margin-top: 6px;
+      font-size: 16px;
       color: var(--muted);
-      font-size: 18px;
     }}
     .clock {{
-      text-align: right;
+      text-align:right;
+      line-height:1.05;
     }}
     .clock .time {{
       font-size: 64px;
       font-weight: 800;
-      line-height: 1;
     }}
     .clock .date {{
       margin-top: 6px;
-      color: var(--muted);
       font-size: 18px;
+      color: var(--muted);
     }}
 
+    /* cards row */
     .cards {{
-      flex: 1;
       display: grid;
       grid-template-columns: repeat(3, 1fr);
       gap: 18px;
+      align-items: stretch;
       min-height: 0;
     }}
     .card {{
-      background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
-      border: 1px solid var(--stroke);
       border-radius: 28px;
-      padding: 22px 26px;
-      display: flex;
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border: 1px solid rgba(255,255,255,0.10);
+      box-shadow: 0 20px 40px rgba(0,0,0,0.35);
+      position: relative;
+      overflow: hidden;
+      padding: 26px;
+      display:flex;
       flex-direction: column;
       justify-content: space-between;
-      box-shadow: 0 18px 60px rgba(0,0,0,0.45);
+    }}
+    .card:before {{
+      content:"";
+      position:absolute;
+      inset:0;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      pointer-events:none;
     }}
     .label {{
-      font-size: 26px;
-      letter-spacing: 2px;
-      color: rgba(243,244,246,0.75);
-      font-weight: 800;
+      font-size: 22px;
+      letter-spacing: 3px;
+      color: rgba(255,255,255,0.72);
+      font-weight: 700;
     }}
     .value {{
-      display: flex;
+      display:flex;
       align-items: baseline;
       gap: 14px;
       margin-top: 8px;
     }}
     .num {{
-      font-size: 110px;
+      font-size: 96px;
       font-weight: 900;
-      letter-spacing: 1px;
-      line-height: 1;
+      letter-spacing: 0.5px;
+      white-space: nowrap;
     }}
     .try {{
       font-size: 62px;
-      color: var(--gold);
       font-weight: 900;
+      color: var(--gold);
     }}
     .updated {{
-      color: rgba(243,244,246,0.45);
       font-size: 18px;
+      color: rgba(255,255,255,0.55);
     }}
 
     .bottom {{
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
+      display:flex;
       gap: 14px;
-      align-items: center;
+      align-items:center;
+      justify-content: space-between;
+      flex-wrap: wrap;
     }}
     .pill {{
-      background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.10);
       border-radius: 999px;
-      padding: 14px 18px;
-      color: rgba(243,244,246,0.72);
-      display: flex;
-      gap: 12px;
-      align-items: center;
-      justify-content: center;
-      font-size: 18px;
+      padding: 12px 16px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.10);
+      color: rgba(255,255,255,0.78);
+      display:flex;
+      align-items:center;
+      gap: 10px;
+      font-size: 16px;
     }}
     .dot {{
-      width: 10px; height: 10px; border-radius: 999px;
-      background: var(--ok);
-      box-shadow: 0 0 0 4px rgba(52,199,89,0.15);
+      width: 10px; height: 10px;
+      border-radius: 99px;
+      background: #21c55d;
     }}
-    .dot.red {{
-      background: var(--danger);
-      box-shadow: 0 0 0 4px rgba(255,59,48,0.15);
-    }}
-    .rightNote {{
-      justify-content: flex-end;
-    }}
+    .dot.red {{ background:#ef4444; }}
+    .muted {{ color: rgba(255,255,255,0.62); }}
 
-    @media (max-width: 1100px) {{
-      .top {{ grid-template-columns: 96px 1fr; }}
-      .clock {{ text-align: left; }}
-      .cards {{ grid-template-columns: 1fr; }}
-      .num {{ font-size: 86px; }}
-      .try {{ font-size: 50px; }}
+    /* Make it strongly landscape-friendly */
+    @media (max-width: 1000px) {{
+      .title h1 {{ font-size: 34px; }}
+      .clock .time {{ font-size: 52px; }}
+      .num {{ font-size: 72px; }}
+      .try {{ font-size: 48px; }}
     }}
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="top">
-      <div class="logoBox">
-        {logo_html}
-        {logo_fallback}
-      </div>
-
       <div class="brand">
-        <h1>SARIKAYA KUYUMCULUK</h1>
-        <div class="sub">Canlı Fiyat Ekranı • TV</div>
+        <div class="logo" title="Sarıkaya Kuyumculuk">
+          <img src="{logo_src}" onerror="this.style.display='none'; this.parentElement.textContent='SK';" alt="logo">
+        </div>
+        <div class="title">
+          <h1>SARIKAYA KUYUMCULUK</h1>
+          <div class="sub">Canlı Fiyat Ekranı • TV</div>
+        </div>
       </div>
-
       <div class="clock">
-        <div class="time" id="t_time">--:--</div>
-        <div class="date" id="t_date">--</div>
+        <div class="time" id="clockTime">--:--</div>
+        <div class="date" id="clockDate">--</div>
       </div>
     </div>
 
@@ -414,101 +519,121 @@ def tv():
       <div class="card">
         <div class="label">ÇEYREK</div>
         <div class="value">
-          <div class="num" id="v_ceyrek">--</div>
+          <div class="num" id="ceyrekNum">{_thousands_tr(int(p["ceyrek"]))}</div>
           <div class="try">₺</div>
         </div>
-        <div class="updated">Güncelleme: <span id="u_ceyrek">--</span></div>
+        <div class="updated">Güncelleme: <span id="ceyrekTs">--</span></div>
       </div>
 
       <div class="card">
         <div class="label">YARIM</div>
         <div class="value">
-          <div class="num" id="v_yarim">--</div>
+          <div class="num" id="yarimNum">{_thousands_tr(int(p["yarim"]))}</div>
           <div class="try">₺</div>
         </div>
-        <div class="updated">Güncelleme: <span id="u_yarim">--</span></div>
+        <div class="updated">Güncelleme: <span id="yarimTs">--</span></div>
       </div>
 
       <div class="card">
         <div class="label">TAM</div>
         <div class="value">
-          <div class="num" id="v_tam">--</div>
+          <div class="num" id="tamNum">{_thousands_tr(int(p["tam"]))}</div>
           <div class="try">₺</div>
         </div>
-        <div class="updated">Güncelleme: <span id="u_tam">--</span></div>
+        <div class="updated">Güncelleme: <span id="tamTs">--</span></div>
       </div>
     </div>
 
     <div class="bottom">
-      <div class="pill" id="p_auto"><span class="dot" id="dot"></span>Otomatik güncelleniyor</div>
-      <div class="pill" id="p_source">Kaynak: --</div>
-      <div class="pill rightNote" id="p_last">Son güncelleme: --</div>
+      <div class="pill" id="pillStatus">
+        <span class="dot" id="dotStatus"></span>
+        <span id="statusText">Otomatik güncelleniyor</span>
+      </div>
+
+      <div class="pill">
+        <span class="muted">Kaynak:</span>
+        <b id="sourceText">{data["source"]}</b>
+      </div>
+
+      <div class="pill">
+        <span class="muted">Son güncelleme:</span>
+        <b id="lastUpdate">--</b>
+      </div>
+
+      <div class="pill">
+        Hayırlı işler dileriz
+      </div>
     </div>
   </div>
 
 <script>
-  function pad(n) {{ return String(n).padStart(2,'0'); }}
+  const REFRESH_SECONDS = {REFRESH_SECONDS};
 
-  function tickClock() {{
-    const d = new Date();
-    document.getElementById('t_time').textContent = pad(d.getHours()) + ":" + pad(d.getMinutes());
+  function pad(n) {{ return String(n).padStart(2, '0'); }}
+  function fmtTime(d) {{ return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()); }}
+  function fmtDateTR(d) {{
     const days = ["Pazar","Pazartesi","Salı","Çarşamba","Perşembe","Cuma","Cumartesi"];
     const months = ["Ocak","Şubat","Mart","Nisan","Mayıs","Haziran","Temmuz","Ağustos","Eylül","Ekim","Kasım","Aralık"];
-    document.getElementById('t_date').textContent =
-      d.getDate() + " " + months[d.getMonth()] + " " + d.getFullYear() + " • " + days[d.getDay()];
-  }}
-  setInterval(tickClock, 1000);
-  tickClock();
-
-  function fmtTR(n) {{
-    try {{
-      return new Intl.NumberFormat('tr-TR').format(Number(n));
-    }} catch(e) {{
-      return String(n);
-    }}
+    return d.getDate() + " " + months[d.getMonth()] + " " + d.getFullYear() + " • " + days[d.getDay()];
   }}
 
-  async function refresh() {{
+  function thousandsTR(x) {{
+    const s = String(x);
+    return s.replace(/\\B(?=(\\d{{3}})+(?!\\d))/g, ".");
+  }}
+
+  function updateClock() {{
+    const d = new Date();
+    document.getElementById("clockTime").textContent = pad(d.getHours()) + ":" + pad(d.getMinutes());
+    document.getElementById("clockDate").textContent = fmtDateTR(d);
+  }}
+
+  async function refreshPrices() {{
     try {{
-      const r = await fetch('/prices', {{ cache: 'no-store' }});
-      const j = await r.json();
+      const res = await fetch("/prices", {{ cache: "no-store" }});
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
 
-      const p = (j && j.prices) ? j.prices : null;
-      if (p) {{
-        document.getElementById('v_ceyrek').textContent = fmtTR(p.ceyrek);
-        document.getElementById('v_yarim').textContent  = fmtTR(p.yarim);
-        document.getElementById('v_tam').textContent    = fmtTR(p.tam);
+      const p = data.prices;
+      const ts = new Date((data.last_update_ts || Date.now()/1000) * 1000);
+      const stamp = fmtTime(ts);
 
-        const now = new Date();
-        const stamp = pad(now.getHours()) + ":" + pad(now.getMinutes()) + ":" + pad(now.getSeconds());
-        document.getElementById('u_ceyrek').textContent = stamp;
-        document.getElementById('u_yarim').textContent  = stamp;
-        document.getElementById('u_tam').textContent    = stamp;
+      document.getElementById("ceyrekNum").textContent = thousandsTR(p.ceyrek);
+      document.getElementById("yarimNum").textContent  = thousandsTR(p.yarim);
+      document.getElementById("tamNum").textContent    = thousandsTR(p.tam);
 
-        document.getElementById('p_last').textContent = "Son güncelleme: " + stamp;
-      }}
+      document.getElementById("ceyrekTs").textContent = stamp;
+      document.getElementById("yarimTs").textContent  = stamp;
+      document.getElementById("tamTs").textContent    = stamp;
 
-      const source = j.source || "--";
-      document.getElementById('p_source').textContent = "Kaynak: " + source;
+      document.getElementById("sourceText").textContent = data.source || "YEDEK";
+      document.getElementById("lastUpdate").textContent = stamp;
 
-      const dot = document.getElementById('dot');
-      if (source === "API" || source === "CACHE") {{
-        dot.classList.remove('red');
+      // status pill
+      const dot = document.getElementById("dotStatus");
+      const st = document.getElementById("statusText");
+      if ((data.source || "") === "API") {{
+        dot.className = "dot";
+        st.textContent = "Otomatik güncelleniyor";
+      }} else if ((data.source || "") === "CACHE") {{
+        dot.className = "dot";
+        st.textContent = "Cache (geçici) kullanılıyor";
       }} else {{
-        dot.classList.add('red');
+        dot.className = "dot red";
+        st.textContent = "YEDEK • API yok/erişilemiyor";
       }}
-
-      // hata varsa konsola yaz (TV ekranında bozmayalım)
-      if (j.last_error) console.warn("last_error:", j.last_error);
-
     }} catch (e) {{
-      console.error(e);
+      const dot = document.getElementById("dotStatus");
+      const st = document.getElementById("statusText");
+      dot.className = "dot red";
+      st.textContent = "Bağlantı sorunu";
     }}
   }}
 
-  // 5 sn'de bir güncelle
-  setInterval(refresh, 5000);
-  refresh();
+  updateClock();
+  setInterval(updateClock, 1000);
+  refreshPrices();
+  setInterval(refreshPrices, REFRESH_SECONDS * 1000);
 </script>
 </body>
 </html>
